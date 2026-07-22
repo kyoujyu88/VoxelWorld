@@ -2,27 +2,38 @@ import './style.css';
 import * as THREE from 'three';
 import { probeXRSupport } from './xr/capabilities';
 import { requestArSession, readSessionInfo, type SessionInfo } from './xr/session';
-import { readCpuDepthFrame } from './xr/depth';
-import { DepthHeatmapView, computeDepthStats, type DepthStats } from './render/depthHeatmap';
+import { readCpuDepthFrame, type CpuDepthFrame } from './xr/depth';
+import { reprojectDepthFrame } from './xr/reproject';
+import { computeDepthStats } from './render/depthHeatmap';
+import { VoxelGrid } from './voxel/grid';
+import { VoxelRenderer } from './render/voxelRenderer';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { el, clear } from './ui/dom';
-import type { CpuDepthFrame } from './xr/depth';
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('#app container not found');
 
-// Grayscale range. ARCore depth is most accurate 0.5–5 m; we start slightly nearer.
-const NEAR_M = 0.3;
-const FAR_M = 5.0;
-const HEATMAP_INTERVAL_MS = 66; // ~15 Hz redraw
-const STATS_INTERVAL_MS = 250; // ~4 Hz text update
+const VOXEL_SIZE = 0.02; // internal fine grid (2 cm)
+const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accurate 0.5–5 m
+const MAX_M = 4.0;
+const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
+const MIN_OBS = 2; // render/keep a voxel once seen at least this many times (rejects transient noise)
+const REBUILD_MS = 250; // InstancedMesh rebuild cadence
+const RENDER_CAP = 150_000;
+const GRID_CAP = 400_000;
+
+interface ScanState {
+  accumulating: boolean;
+  flipY: boolean; // NDC y convention; toggle on-device to calibrate reprojection (R6)
+}
 
 async function main(app: HTMLDivElement): Promise<void> {
   const header = el('header', { className: 'app-header' }, [
     el('h1', { textContent: 'VoxelWorld — WebXR ボクセルスキャナ' }),
     el('p', {
       className: 'subtitle',
-      textContent: 'Phase 2: 深度の可視化 — 深度を白黒ヒートマップで表示します。',
+      textContent:
+        'Phase 3: ボクセル蓄積 — 深度をワールド座標へ逆投影し 2cm グリッドに蓄積します。',
     }),
   ]);
 
@@ -46,7 +57,7 @@ async function main(app: HTMLDivElement): Promise<void> {
       el('p', {
         className: 'hint',
         textContent:
-          '開始後、端末をゆっくり動かすと深度が生成されます。近い物ほど明るく表示されます（欠損は透明）。',
+          '開始後、端末をゆっくり動かすと、見た面にボクセルが積もっていきます。色は暫定で高さ表示です（実色は次段）。',
       }),
     );
   }
@@ -71,31 +82,45 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera();
 
-  // dom-overlay root. The UA controls the root element's box, so all visible styling lives
-  // on the inner .hud child (own background, bottom-anchored, safe-area padding).
+  const grid = new VoxelGrid({ voxelSize: VOXEL_SIZE, maxVoxels: GRID_CAP });
+  const voxels = new VoxelRenderer(RENDER_CAP, VOXEL_SIZE);
+  scene.add(voxels.mesh);
+
+  const state: ScanState = { accumulating: true, flipY: true };
+  const heightColor = new THREE.Color();
+
   const overlay = el('div', { className: 'xr-overlay' });
   const hud = el('div', { className: 'hud' });
-  const heatmap = new DepthHeatmapView();
   const statsSlot = el('div', { className: 'stats' });
+  const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
+  const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
+  const flipBtn = el('button', { className: 'ctl', textContent: '↕ 上下反転' });
   const endBtn = el('button', { className: 'ghost', textContent: 'AR を終了' });
-
   hud.append(
-    el('div', {
-      className: 'hud-title',
-      textContent: 'Phase 2: 深度ヒートマップ（近い=明るい / 欠損=透明）',
-    }),
-    heatmap.canvas,
-    renderLegend(),
+    el('div', { className: 'hud-title', textContent: 'Phase 3: ボクセル蓄積（色は暫定＝高さ）' }),
     statsSlot,
-    endBtn,
+    el('div', { className: 'controls' }, [pauseBtn, clearBtn, flipBtn, endBtn]),
   );
   overlay.append(hud);
   document.body.append(overlay);
+
+  pauseBtn.addEventListener('click', () => {
+    state.accumulating = !state.accumulating;
+    pauseBtn.textContent = state.accumulating ? '⏸ 一時停止' : '▶ 再開';
+  });
+  clearBtn.addEventListener('click', () => {
+    grid.clear();
+    voxels.rebuild(grid, MIN_OBS);
+  });
+  flipBtn.addEventListener('click', () => {
+    state.flipY = !state.flipY;
+  });
 
   const cleanup = (): void => {
     renderer.setAnimationLoop(null);
     renderer.domElement.remove();
     overlay.remove();
+    voxels.dispose();
     renderer.dispose();
   };
 
@@ -121,8 +146,16 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   }
 
   const info: SessionInfo = readSessionInfo(session);
-  let lastHeatmap = 0;
-  let lastStats = 0;
+  let lastRebuild = 0;
+  let rendered = 0;
+  let latestDepth: CpuDepthFrame | null = null;
+
+  // Temporary height-based color (real camera color is the next increment). No allocation.
+  const accumulate = (x: number, y: number, z: number): void => {
+    const t = Math.min(1, Math.max(0, (y + 1.5) / 4));
+    heightColor.setHSL((1 - t) * 0.66, 0.7, 0.5);
+    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255);
+  };
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
     renderer.render(scene, camera);
@@ -132,65 +165,60 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     const pose = refSpace ? frame.getViewerPose(refSpace) : null;
     if (!pose || pose.views.length === 0) return;
 
-    const depth = readCpuDepthFrame(frame, pose.views[0]);
+    const view = pose.views[0];
+    latestDepth = readCpuDepthFrame(frame, view);
 
-    if (depth && time - lastHeatmap >= HEATMAP_INTERVAL_MS) {
-      lastHeatmap = time;
-      heatmap.update(depth, { minMeters: NEAR_M, maxMeters: FAR_M, nearBright: true });
+    if (latestDepth && state.accumulating) {
+      reprojectDepthFrame(
+        latestDepth,
+        view.projectionMatrix,
+        view.transform.matrix,
+        { minMeters: MIN_M, maxMeters: MAX_M, stride: STRIDE, flipY: state.flipY },
+        accumulate,
+      );
     }
 
-    if (time - lastStats >= STATS_INTERVAL_MS) {
-      lastStats = time;
-      updateStats(statsSlot, info, depth);
+    if (time - lastRebuild >= REBUILD_MS) {
+      lastRebuild = time;
+      rendered = voxels.rebuild(grid, MIN_OBS);
+      updateStats(statsSlot, info, state, grid, rendered, latestDepth);
     }
   });
 }
 
-function renderLegend(): HTMLElement {
-  return el('div', { className: 'legend' }, [
-    el('span', { textContent: `近い (${NEAR_M.toFixed(1)}m)` }),
-    el('span', { className: 'ramp' }),
-    el('span', { textContent: `遠い (${FAR_M.toFixed(1)}m)` }),
-  ]);
-}
-
-function updateStats(slot: HTMLElement, info: SessionInfo, depth: CpuDepthFrame | null): void {
+function updateStats(
+  slot: HTMLElement,
+  info: SessionInfo,
+  state: ScanState,
+  grid: VoxelGrid,
+  rendered: number,
+  depth: CpuDepthFrame | null,
+): void {
   const rows: KV[] = [
-    {
-      label: 'depthUsage / format',
-      value: `${info.depthUsage ?? '—'} / ${info.depthDataFormat ?? '—'}`,
-    },
+    { label: '状態', value: state.accumulating ? '● 蓄積中' : '❚❚ 一時停止' },
+    { label: 'ボクセル(2cm)', value: `${grid.size.toLocaleString()} セル` },
+    { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
+    { label: 'flipY(上下)', value: state.flipY ? 'ON' : 'OFF' },
+    { label: 'depthUsage', value: info.depthUsage ?? '—' },
   ];
 
-  if (!depth) {
-    rows.push({ label: '深度', value: '取得できず（端末を動かしてください）' });
-  } else {
-    const stats: DepthStats = computeDepthStats(
-      depth.data,
-      depth.width,
-      depth.height,
-      depth.rawValueToMeters,
-    );
-    const coverage = stats.totalCount > 0 ? (100 * stats.validCount) / stats.totalCount : 0;
+  if (depth) {
+    const s = computeDepthStats(depth.data, depth.width, depth.height, depth.rawValueToMeters);
+    const coverage = s.totalCount > 0 ? (100 * s.validCount) / s.totalCount : 0;
     rows.push(
-      { label: '深度バッファ', value: `${depth.width} x ${depth.height}` },
+      { label: '深度有効率', value: `${coverage.toFixed(0)}%` },
       {
-        label: '有効率',
-        value: `${coverage.toFixed(0)}% (${stats.validCount}/${stats.totalCount})`,
-      },
-      {
-        label: '距離 min/中央/max',
-        value: `${meters(stats.minMeters)} / ${meters(stats.medianMeters)} / ${meters(stats.maxMeters)}`,
+        label: '距離 中央',
+        value: s.medianMeters === null ? '—' : `${s.medianMeters.toFixed(2)}m`,
       },
     );
+  }
+  if (grid.droppedAtCap > 0) {
+    rows.push({ label: '⚠ グリッド上限', value: `${grid.droppedAtCap.toLocaleString()} 破棄` });
   }
 
   clear(slot);
   slot.append(renderKVTable(rows));
-}
-
-function meters(n: number | null): string {
-  return n === null ? '—' : `${n.toFixed(2)}m`;
 }
 
 function showError(slot: HTMLElement, err: unknown): void {
