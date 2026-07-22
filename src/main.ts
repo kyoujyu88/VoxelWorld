@@ -1,29 +1,28 @@
 import './style.css';
 import * as THREE from 'three';
 import { probeXRSupport } from './xr/capabilities';
-import {
-  requestArSession,
-  readSessionInfo,
-  readDepthProbe,
-  readCameraProbe,
-  type SessionInfo,
-} from './xr/session';
+import { requestArSession, readSessionInfo, type SessionInfo } from './xr/session';
+import { readCpuDepthFrame } from './xr/depth';
+import { DepthHeatmapView, computeDepthStats, type DepthStats } from './render/depthHeatmap';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { el, clear } from './ui/dom';
+import type { CpuDepthFrame } from './xr/depth';
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('#app container not found');
 
-function fmtInt(n: number | null): string {
-  return n === null ? '—' : String(Math.round(n));
-}
+// Grayscale range. ARCore depth is most accurate 0.5–5 m; we start slightly nearer.
+const NEAR_M = 0.3;
+const FAR_M = 5.0;
+const HEATMAP_INTERVAL_MS = 66; // ~15 Hz redraw
+const STATS_INTERVAL_MS = 250; // ~4 Hz text update
 
 async function main(app: HTMLDivElement): Promise<void> {
   const header = el('header', { className: 'app-header' }, [
     el('h1', { textContent: 'VoxelWorld — WebXR ボクセルスキャナ' }),
     el('p', {
       className: 'subtitle',
-      textContent: 'Phase 1: 環境確認 — immersive-ar と depth-sensing の対応を判定します。',
+      textContent: 'Phase 2: 深度の可視化 — 深度を白黒ヒートマップで表示します。',
     }),
   ]);
 
@@ -47,7 +46,7 @@ async function main(app: HTMLDivElement): Promise<void> {
       el('p', {
         className: 'hint',
         textContent:
-          '開始後、端末をゆっくり動かすと深度が生成されます（静止状態では深度は出ません）。',
+          '開始後、端末をゆっくり動かすと深度が生成されます。近い物ほど明るく表示されます（欠損は透明）。',
       }),
     );
   }
@@ -72,11 +71,25 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera();
 
-  // dom-overlay root: a live info panel drawn over the camera feed.
+  // dom-overlay root. The UA controls the root element's box, so all visible styling lives
+  // on the inner .hud child (own background, bottom-anchored, safe-area padding).
   const overlay = el('div', { className: 'xr-overlay' });
-  const liveTable = el('div', { className: 'live' });
+  const hud = el('div', { className: 'hud' });
+  const heatmap = new DepthHeatmapView();
+  const statsSlot = el('div', { className: 'stats' });
   const endBtn = el('button', { className: 'ghost', textContent: 'AR を終了' });
-  overlay.append(el('h2', { textContent: '深度センシング 実測値' }), liveTable, endBtn);
+
+  hud.append(
+    el('div', {
+      className: 'hud-title',
+      textContent: 'Phase 2: 深度ヒートマップ（近い=明るい / 欠損=透明）',
+    }),
+    heatmap.canvas,
+    renderLegend(),
+    statsSlot,
+    endBtn,
+  );
+  overlay.append(hud);
   document.body.append(overlay);
 
   const cleanup = (): void => {
@@ -108,62 +121,76 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   }
 
   const info: SessionInfo = readSessionInfo(session);
-  let lastUpdate = 0;
+  let lastHeatmap = 0;
+  let lastStats = 0;
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
     renderer.render(scene, camera);
     if (!frame) return;
-    if (time - lastUpdate < 250) return; // throttle UI to ~4 Hz
-    lastUpdate = time;
-    updateLivePanel(liveTable, renderer, frame, info);
+
+    const refSpace = renderer.xr.getReferenceSpace();
+    const pose = refSpace ? frame.getViewerPose(refSpace) : null;
+    if (!pose || pose.views.length === 0) return;
+
+    const depth = readCpuDepthFrame(frame, pose.views[0]);
+
+    if (depth && time - lastHeatmap >= HEATMAP_INTERVAL_MS) {
+      lastHeatmap = time;
+      heatmap.update(depth, { minMeters: NEAR_M, maxMeters: FAR_M, nearBright: true });
+    }
+
+    if (time - lastStats >= STATS_INTERVAL_MS) {
+      lastStats = time;
+      updateStats(statsSlot, info, depth);
+    }
   });
 }
 
-function updateLivePanel(
-  liveTable: HTMLElement,
-  renderer: THREE.WebGLRenderer,
-  frame: XRFrame,
-  info: SessionInfo,
-): void {
+function renderLegend(): HTMLElement {
+  return el('div', { className: 'legend' }, [
+    el('span', { textContent: `近い (${NEAR_M.toFixed(1)}m)` }),
+    el('span', { className: 'ramp' }),
+    el('span', { textContent: `遠い (${FAR_M.toFixed(1)}m)` }),
+  ]);
+}
+
+function updateStats(slot: HTMLElement, info: SessionInfo, depth: CpuDepthFrame | null): void {
   const rows: KV[] = [
-    { label: 'depthUsage', value: info.depthUsage ?? '(未報告)' },
-    { label: 'depthDataFormat', value: info.depthDataFormat ?? '(未報告)' },
-    { label: 'enabledFeatures', value: info.enabledFeatures.join(', ') || '(なし)' },
+    {
+      label: 'depthUsage / format',
+      value: `${info.depthUsage ?? '—'} / ${info.depthDataFormat ?? '—'}`,
+    },
   ];
 
-  const refSpace = renderer.xr.getReferenceSpace();
-  const pose = refSpace ? frame.getViewerPose(refSpace) : null;
-
-  if (pose && pose.views.length > 0) {
-    const view = pose.views[0];
-    const depth = readDepthProbe(frame, view);
-    const cam = readCameraProbe(view);
+  if (!depth) {
+    rows.push({ label: '深度', value: '取得できず（端末を動かしてください）' });
+  } else {
+    const stats: DepthStats = computeDepthStats(
+      depth.data,
+      depth.width,
+      depth.height,
+      depth.rawValueToMeters,
+    );
+    const coverage = stats.totalCount > 0 ? (100 * stats.validCount) / stats.totalCount : 0;
     rows.push(
+      { label: '深度バッファ', value: `${depth.width} x ${depth.height}` },
       {
-        label: '深度取得',
-        value: depth.depthAvailable ? '成功' : '取得できず（端末を動かしてください）',
+        label: '有効率',
+        value: `${coverage.toFixed(0)}% (${stats.validCount}/${stats.totalCount})`,
       },
       {
-        label: '深度バッファ',
-        value: depth.depthAvailable ? `${fmtInt(depth.width)} x ${fmtInt(depth.height)}` : '—',
-      },
-      {
-        label: 'rawValueToMeters',
-        value: depth.rawValueToMeters === null ? '—' : depth.rawValueToMeters.toExponential(4),
-      },
-      {
-        label: 'camera-access',
-        value: cam.available
-          ? `有効 (${fmtInt(cam.width)} x ${fmtInt(cam.height)})`
-          : '無効/未許可',
+        label: '距離 min/中央/max',
+        value: `${meters(stats.minMeters)} / ${meters(stats.medianMeters)} / ${meters(stats.maxMeters)}`,
       },
     );
-  } else {
-    rows.push({ label: 'viewerPose', value: '未取得（トラッキング初期化中）' });
   }
 
-  clear(liveTable);
-  liveTable.append(renderKVTable(rows));
+  clear(slot);
+  slot.append(renderKVTable(rows));
+}
+
+function meters(n: number | null): string {
+  return n === null ? '—' : `${n.toFixed(2)}m`;
 }
 
 function showError(slot: HTMLElement, err: unknown): void {
@@ -173,7 +200,7 @@ function showError(slot: HTMLElement, err: unknown): void {
   const hints: Record<string, string> = {
     NotSupportedError:
       'depth-sensing が未対応の可能性。ARCore の導入と Chrome の更新を確認してください。',
-    SecurityError: 'セキュアコンテキストが必要です。localhost / HTTPS で開いてください。',
+    SecurityError: 'セキュアコンテキストが必要です。HTTPS / localhost で開いてください。',
     NotAllowedError: '権限が拒否されました。カメラ / AR の許可を確認してください。',
     InvalidStateError: 'セッション状態が不正です。ページを再読み込みしてください。',
   };

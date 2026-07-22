@@ -140,21 +140,63 @@ button.ghost {
 }
 
 /* dom-overlay live panel. Phase 5 replaces this with the bottom-half layout. */
+/* dom-overlay root: the UA controls this element's box, so keep it a transparent
+   passthrough and put all visible styling on the inner .hud. */
 .xr-overlay {
+  position: fixed;
+  inset: 0;
+  pointer-events: none;
+}
+
+/* Bottom heads-up panel (Phase 5 will grow this into the full bottom-half layout). */
+.hud {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
-  background: rgba(12, 15, 19, 0.9);
+  pointer-events: auto;
+  background: rgba(10, 13, 17, 0.92);
   border-top: 1px solid #2a323d;
-  padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
-  max-height: 55vh;
+  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+  max-height: 62vh;
   overflow: auto;
 }
 
-.xr-overlay h2 {
-  font-size: 15px;
-  margin: 0 0 8px;
+.hud-title {
+  font-size: 12px;
+  color: var(--muted);
+  margin-bottom: 8px;
+}
+
+.depth-canvas {
+  display: block;
+  width: 100%;
+  height: auto;
+  image-rendering: pixelated;
+  background: #000;
+  border: 1px solid #2a323d;
+  border-radius: 6px;
+}
+
+.legend {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 11px;
+  color: var(--muted);
+  margin: 8px 0;
+}
+
+.legend .ramp {
+  flex: 1;
+  height: 10px;
+  border-radius: 3px;
+  border: 1px solid #333;
+  background: linear-gradient(90deg, #fff, #000);
+}
+
+.stats {
+  margin-top: 4px;
 }
 
 table.kv {
@@ -179,6 +221,6 @@ table.kv td {
   word-break: break-word;
 }
 
-.xr-overlay button.ghost {
-  margin-top: 10px;
+.hud button.ghost {
+  margin-top: 12px;
 }
