@@ -1,0 +1,184 @@
+:root {
+  --bg: #0f1216;
+  --panel: #181d24;
+  --panel-2: #20262f;
+  --text: #e7ecf2;
+  --muted: #9aa7b6;
+  --ok: #35c46a;
+  --err: #ff5d5d;
+  --accent: #4c8dff;
+  color-scheme: dark;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+html,
+body {
+  margin: 0;
+  min-height: 100%;
+  background: var(--bg);
+  color: var(--text);
+  font-family:
+    system-ui,
+    -apple-system,
+    'Segoe UI',
+    Roboto,
+    'Noto Sans JP',
+    sans-serif;
+  line-height: 1.6;
+}
+
+#app {
+  max-width: 720px;
+  margin: 0 auto;
+  padding: 20px 16px 48px;
+}
+
+.app-header h1 {
+  font-size: 20px;
+  margin: 0 0 4px;
+}
+
+.subtitle {
+  color: var(--muted);
+  margin: 0 0 16px;
+  font-size: 14px;
+}
+
+.slot {
+  margin: 14px 0;
+}
+
+.card {
+  background: var(--panel);
+  border: 1px solid #2a323d;
+  border-radius: 12px;
+  padding: 14px 16px;
+}
+
+.card.error {
+  border-color: var(--err);
+}
+
+.status-title {
+  font-size: 16px;
+  margin: 0 0 8px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.badge {
+  font-size: 12px;
+  font-weight: 700;
+  padding: 2px 8px;
+  border-radius: 999px;
+  letter-spacing: 0.04em;
+}
+
+.badge-ok {
+  background: rgba(53, 196, 106, 0.16);
+  color: var(--ok);
+}
+
+.badge-error {
+  background: rgba(255, 93, 93, 0.16);
+  color: var(--err);
+}
+
+.reasons {
+  margin: 0;
+  padding-left: 18px;
+  color: var(--muted);
+  font-size: 14px;
+}
+
+.hint {
+  color: var(--muted);
+  font-size: 13px;
+  margin: 8px 0 0;
+}
+
+button.primary {
+  appearance: none;
+  border: none;
+  border-radius: 10px;
+  background: var(--accent);
+  color: #fff;
+  font-size: 15px;
+  font-weight: 600;
+  padding: 12px 18px;
+  width: 100%;
+  cursor: pointer;
+}
+
+button.primary:disabled {
+  background: #384150;
+  color: var(--muted);
+  cursor: not-allowed;
+}
+
+button.ghost {
+  appearance: none;
+  border: 1px solid #3a4450;
+  border-radius: 8px;
+  background: transparent;
+  color: var(--text);
+  padding: 8px 14px;
+  font-size: 14px;
+  cursor: pointer;
+}
+
+/* Fullscreen XR canvas (compositor output). */
+.xr-canvas {
+  position: fixed;
+  inset: 0;
+  width: 100vw;
+  height: 100vh;
+}
+
+/* dom-overlay live panel. Phase 5 replaces this with the bottom-half layout. */
+.xr-overlay {
+  position: fixed;
+  left: 0;
+  right: 0;
+  bottom: 0;
+  background: rgba(12, 15, 19, 0.9);
+  border-top: 1px solid #2a323d;
+  padding: 12px 16px calc(12px + env(safe-area-inset-bottom));
+  max-height: 55vh;
+  overflow: auto;
+}
+
+.xr-overlay h2 {
+  font-size: 15px;
+  margin: 0 0 8px;
+}
+
+table.kv {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 13px;
+}
+
+table.kv th {
+  text-align: left;
+  color: var(--muted);
+  font-weight: 500;
+  padding: 4px 8px 4px 0;
+  white-space: nowrap;
+  vertical-align: top;
+  width: 40%;
+}
+
+table.kv td {
+  padding: 4px 0;
+  font-variant-numeric: tabular-nums;
+  word-break: break-word;
+}
+
+.xr-overlay button.ghost {
+  margin-top: 10px;
+}
