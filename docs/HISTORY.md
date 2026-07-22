@@ -4,6 +4,43 @@
 
 ---
 
+## 2026-07-22 — Phase 2: 深度の可視化（+ Phase 1 実機合格）
+
+### Phase 1 実機確認結果（Pixel 9a / GitHub Pages 経由）
+
+全項目パス。RESEARCH.md の予測（160×90）とも一致:
+
+- `depthUsage` = **cpu-optimized**（第一希望。GPU readback フォールバックは不要）
+- `depthDataFormat` = **luminance-alpha**（uint16）
+- `enabledFeatures` = viewer, camera-access, local-floor, local, dom-overlay, depth-sensing
+- 深度バッファ = **160 x 90**、`rawValueToMeters` = **1.0e-3**（生値は mm。1mm 精度で 2cm ボクセルに十分）
+- `camera-access` = **有効（カメラ画像 855 x 1920）** → 色取得の前提クリア（R7）
+- → R1〜R4, R7 合格。R5 は Phase 2 で確認。
+
+### 何を（Phase 2）
+
+- `src/xr/depth.ts`: `readCpuDepthFrame()` — width/height/型付きデータ/rawValueToMeters/normDepthBufferFromNormView と `metersAt()`。フォーマット非依存（uint16 / float32）。Phase 3 の逆投影で再利用。
+- `src/render/depthHeatmap.ts`: 純関数 `depthToRGBA`（近い=明るい、欠損=透明、範囲クランプ）と `computeDepthStats`（有効率・min/中央/max[m]）+ `DepthHeatmapView`（canvas + ImageData）。
+- `src/main.ts`: AR オーバーレイを下部 HUD 化。深度ヒートマップ canvas（~15Hz）+ 凡例 + 統計（~4Hz）+ 終了ボタン。
+- `src/style.css`: dom-overlay ルートは UA 制御のため透過パススルーにし、可視要素は子 `.hud` に集約（safe-area 対応、下部固定）。
+- Vitest 8 件追加（計 19）。
+
+### 主要な判断とその理由
+
+1. **Phase 2 は 2D canvas ヒートマップで可視化**（AR 空間へのシェーダ整列はしない）
+   - 理由: 完了条件は「動かすと深度が取れているのが目視できる」こと。2D ヒートマップが最短で明確。カメラ整列は Phase 3/5 の課題（深度160×90 は横長、カメラ855×1920 は縦長で向きが異なる → view 空間経由の対応が要る）。
+2. **深度読み取りをフォーマット非依存に**（bytesPerSample で uint16/float32 判定）
+   - 理由: 実機は luminance-alpha だが、将来 float32 でも同じ経路で扱えるように。
+3. **`.hud` 子要素に可視スタイルを集約**
+   - 理由: Phase 1 の実機スクショで、オーバーレイ内容が画面上部のブラウザ AR 表示と重なって見えた。dom-overlay ルートは UA が箱を制御するため、子要素で位置/背景/safe-area を持たせる方が予測可能。
+
+### 検証
+
+- ローカル: `tsc --noEmit` green、Vitest **19** green、`vite build` 成功。
+- 未検証（実機）: R5（ヒートマップが動く目視確認）。→ `docs/PROGRESS.md` の手順で依頼。
+
+---
+
 ## 2026-07-22 — インフラ: GitHub Pages 自動デプロイ
 
 ### 何を
