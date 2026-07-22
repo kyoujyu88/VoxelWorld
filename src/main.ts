@@ -15,12 +15,16 @@ if (!app) throw new Error('#app container not found');
 
 const VOXEL_SIZE = 0.02; // internal fine grid (2 cm)
 const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accurate 0.5–5 m
-const MAX_M = 4.0;
+const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and spurious voxels
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
-const MIN_OBS = 2; // render/keep a voxel once seen at least this many times (rejects transient noise)
+const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
 const REBUILD_MS = 250; // InstancedMesh rebuild cadence
 const RENDER_CAP = 150_000;
-const GRID_CAP = 400_000;
+const GRID_CAP = 600_000;
+
+// Temporary height-based color window (local-space Y), floor..ceiling. Replaced by camera color next.
+const HEIGHT_LO = -1.3;
+const HEIGHT_HI = 1.7;
 
 interface ScanState {
   accumulating: boolean;
@@ -151,9 +155,10 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   let latestDepth: CpuDepthFrame | null = null;
 
   // Temporary height-based color (real camera color is the next increment). No allocation.
+  // Wide, saturated band: low(floor)=blue → mid=green → high(ceiling)=red.
   const accumulate = (x: number, y: number, z: number): void => {
-    const t = Math.min(1, Math.max(0, (y + 1.5) / 4));
-    heightColor.setHSL((1 - t) * 0.66, 0.7, 0.5);
+    const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
+    heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
     grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255);
   };
 

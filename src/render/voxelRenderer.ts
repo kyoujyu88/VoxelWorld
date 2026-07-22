@@ -17,7 +17,9 @@ export class VoxelRenderer {
 
   constructor(capacity: number, voxelSize: number) {
     this.capacity = capacity;
-    const geometry = new BoxGeometry(voxelSize * 0.9, voxelSize * 0.9, voxelSize * 0.9);
+    // Cubes noticeably smaller than the cell so the real world shows through the gaps
+    // (makes it possible to judge whether voxels sit on real surfaces).
+    const geometry = new BoxGeometry(voxelSize * 0.55, voxelSize * 0.55, voxelSize * 0.55);
     const material = new MeshBasicMaterial();
     this.mesh = new InstancedMesh(geometry, material, capacity);
     this.mesh.frustumCulled = false;
