@@ -9,46 +9,49 @@
 
 ## 0. エグゼクティブサマリ（確定した設計判断）
 
-| 項目 | 判断 | 根拠 |
-|---|---|---|
-| 深度取得 | WebXR Depth Sensing、**`cpu-optimized` + `luminance-alpha`** を第一候補で要求 | `luminance-alpha` のみが「サポート保証」される唯一のフォーマット。CPU 側でボクセル化するため CPU パスが自然 |
-| 深度の意味 | **カメラ主軸に沿った垂直距離（eye-space の Z）**。レイ長ではない | ARCore 公式 / depth-sensing 原案 explainer |
-| 逆投影 | `normDepthBufferFromNormView` の逆行列 → 正規化ビュー座標 → NDC → `projectionMatrix` の逆でレイ方向 → 垂直深度でスケール → `view.transform` でワールド化 | depth-sensing explainer + ARCore の深度定義 |
-| 色 | カメラ画像は **`camera-access` 機能が必須**。`getCameraImage()` は **GPU テクスチャのみ**（CPU 直読み不可）。色を CPU 蓄積に使うには 1 フレーム 1 回の低解像度 readback が要る | raw-camera-access explainer |
-| レンダリング | three.js r185 で `renderer.xr.setSession()` にセッションを渡す。深度は自前で `frame.getDepthInformation(view)` から読む（three.js の `WebXRDepthSensing` はオクルージョン表示用で、値の取得用途には使わない） | three.js docs / ARButton ソース |
-| 画面分割 | `dom-overlay` で下半分に不透明 DOM を重ね、その中に別 canvas で俯瞰プレビュー | dom-overlays explainer |
-| 内部表現 | 2cm 固定グリッド、量子化整数キーのハッシュマップ（スパース）。表示/出力時に整数倍ダウンサンプル | プロンプト設計要件 2-2 |
-| GLB | `GLTFExporter`、頂点カラー（`COLOR_0`）、**greedy meshing + 内面カリング必須**。InstancedMesh のままではなくマージ済み `BufferGeometry` を出力 | GLTFExporter docs |
-| .vox | RIFF 風チャンク、256³・256 色制限のためモデル分割 + パレット量子化。MagicaVoxel は Z-up なので軸変換が要る | ephtracy 公式フォーマット仕様 |
+| 項目         | 判断                                                                                                                                                                                                          | 根拠                                                                                                        |
+| ------------ | ------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------- | ----------------------------------------------------------------------------------------------------------- |
+| 深度取得     | WebXR Depth Sensing、**`cpu-optimized` + `luminance-alpha`** を第一候補で要求                                                                                                                                 | `luminance-alpha` のみが「サポート保証」される唯一のフォーマット。CPU 側でボクセル化するため CPU パスが自然 |
+| 深度の意味   | **カメラ主軸に沿った垂直距離（eye-space の Z）**。レイ長ではない                                                                                                                                              | ARCore 公式 / depth-sensing 原案 explainer                                                                  |
+| 逆投影       | `normDepthBufferFromNormView` の逆行列 → 正規化ビュー座標 → NDC → `projectionMatrix` の逆でレイ方向 → 垂直深度でスケール → `view.transform` でワールド化                                                      | depth-sensing explainer + ARCore の深度定義                                                                 |
+| 色           | カメラ画像は **`camera-access` 機能が必須**。`getCameraImage()` は **GPU テクスチャのみ**（CPU 直読み不可）。色を CPU 蓄積に使うには 1 フレーム 1 回の低解像度 readback が要る                                | raw-camera-access explainer                                                                                 |
+| レンダリング | three.js r185 で `renderer.xr.setSession()` にセッションを渡す。深度は自前で `frame.getDepthInformation(view)` から読む（three.js の `WebXRDepthSensing` はオクルージョン表示用で、値の取得用途には使わない） | three.js docs / ARButton ソース                                                                             |
+| 画面分割     | `dom-overlay` で下半分に不透明 DOM を重ね、その中に別 canvas で俯瞰プレビュー                                                                                                                                 | dom-overlays explainer                                                                                      |
+| 内部表現     | 2cm 固定グリッド、量子化整数キーのハッシュマップ（スパース）。表示/出力時に整数倍ダウンサンプル                                                                                                               | プロンプト設計要件 2-2                                                                                      |
+| GLB          | `GLTFExporter`、頂点カラー（`COLOR_0`）、**greedy meshing + 内面カリング必須**。InstancedMesh のままではなくマージ済み `BufferGeometry` を出力                                                                | GLTFExporter docs                                                                                           |
+| .vox         | RIFF 風チャンク、256³・256 色制限のためモデル分割 + パレット量子化。MagicaVoxel は Z-up なので軸変換が要る                                                                                                    | ephtracy 公式フォーマット仕様                                                                               |
 
 ---
 
 ## Q1. WebXR Depth Sensing Module の仕様と Chrome for Android の実装状況
 
 ### 仕様（W3C / immersive-web）
+
 - 仕様: [WebXR Depth Sensing Module (W3C WD)](https://www.w3.org/TR/webxr-depth-sensing-1/) / [ED](https://immersive-web.github.io/depth-sensing/) / [explainer](https://github.com/immersive-web/depth-sensing/blob/main/explainer.md)
 - `immersive-ar` セッションの機能として `depth-sensing` を要求する。要求時に **`depthSensing` 設定オブジェクト**を渡す:
 
 ```js
-const session = await navigator.xr.requestSession("immersive-ar", {
-  requiredFeatures: ["depth-sensing"],
+const session = await navigator.xr.requestSession('immersive-ar', {
+  requiredFeatures: ['depth-sensing'],
   depthSensing: {
-    usagePreference: ["cpu-optimized", "gpu-optimized"],   // 優先順
-    dataFormatPreference: ["luminance-alpha", "float32"],   // 優先順
+    usagePreference: ['cpu-optimized', 'gpu-optimized'], // 優先順
+    dataFormatPreference: ['luminance-alpha', 'float32'], // 優先順
   },
 });
 // 実際に採用された構成を必ず確認する
-session.depthUsage;       // "cpu-optimized" | "gpu-optimized"
-session.depthDataFormat;  // "luminance-alpha" | "float32"
+session.depthUsage; // "cpu-optimized" | "gpu-optimized"
+session.depthDataFormat; // "luminance-alpha" | "float32"
 ```
 
 ### `depthUsage`: `cpu-optimized` vs `gpu-optimized`
+
 - **`cpu-optimized`** → `frame.getDepthInformation(view)` が `XRCPUDepthInformation` を返す。`data`（ArrayBuffer）を CPU から直接読める。
 - **`gpu-optimized`** → `xrGlBinding.getDepthInformation(view)` が `XRWebGLDepthInformation` を返す。深度は **不透明テクスチャ**として渡され、CPU から直接は読めない（readback が必要）。
 - **本プロジェクトの選択: `cpu-optimized`**。ワールド座標への逆投影とスパースグリッド蓄積を CPU で行うため。深度バッファは低解像度なので、毎フレーム CPU 読みしても負荷は小さい（下記解像度）。
 - リスク: 端末によっては `cpu-optimized` が拒否され `gpu-optimized` にフォールバックする可能性がある。→ Phase 1 で `session.depthUsage` を実機確認し、`gpu-optimized` しか出ない場合は「深度テクスチャ → オフスクリーン FBO → `gl.readPixels`」のフォールバック経路を用意する（設計に含める）。
 
 ### `depthDataFormat`: `luminance-alpha` vs `float32`
+
 - **`luminance-alpha`** — 2 バイト符号なし整数。CPU では `Uint16Array` として解釈。**唯一「サポート保証」されるフォーマット**（explainer 明記）。
   - GPU シェーダで復元する場合: `dot(texture(...).ra, vec2(255.0, 256.0*255.0)) * rawValueToMeters`（下位バイト=luminance, 上位バイト=alpha）。
 - **`float32`** — 4 バイト浮動小数。CPU では `Float32Array`。精度は高いが対応は保証されない。
@@ -56,10 +59,12 @@ session.depthDataFormat;  // "luminance-alpha" | "float32"
   - `luminance-alpha`（16bit, mm オーダーの `rawValueToMeters`）でも 2cm ボクセルには十分。
 
 ### 深度バッファの実解像度
+
 - 一次情報に「Pixel で必ず N×M」という記載は無い。ARCore 由来の WebXR 深度は**平滑化済みの低解像度バッファ**で、実測では 160×90 前後のオーダー（横持ち基準）とされる。
 - **確定値は実行時に `depthInfo.width` / `depthInfo.height` をログして得る**（Phase 1 の実機確認項目）。設計は解像度非依存にし、サブサンプリング率をパラメータ化する。
 
 ### Chrome for Android 実装状況
+
 - WebXR Depth Sensing は Chrome for Android + ARCore 対応端末で**出荷済み機能**。Pixel 9a は ARCore 対応・ToF 無し → depth-from-motion で深度が出る（プロンプト前提どおり）。
 - ARCore の depth-from-motion は**端末を動かさないと深度が生成されない**、特徴の乏しい面（白壁など）で欠損する、有効範囲 0〜65m・高精度帯 0.5〜5m（プロンプト記載の前提と一致）。
 
@@ -76,19 +81,19 @@ session.depthDataFormat;  // "luminance-alpha" | "float32"
 - 深度読み取りは three.js のレンダーループから:
 
 ```js
-renderer.xr.setReferenceSpaceType("local");   // or "local-floor"
+renderer.xr.setReferenceSpaceType('local'); // or "local-floor"
 renderer.setAnimationLoop((time, frame) => {
   if (!frame) return;
   const refSpace = renderer.xr.getReferenceSpace();
   const pose = frame.getViewerPose(refSpace);
   if (!pose) return;
   for (const view of pose.views) {
-    const depthInfo = frame.getDepthInformation(view);  // XRCPUDepthInformation
+    const depthInfo = frame.getDepthInformation(view); // XRCPUDepthInformation
     if (!depthInfo) continue;
     // depthInfo.width/height/data/rawValueToMeters/normDepthBufferFromNormView
     // view.projectionMatrix, view.transform.matrix, view.transform.inverse.matrix
   }
-  renderer.render(scene, camera);   // three.js が XR カメラを更新
+  renderer.render(scene, camera); // three.js が XR カメラを更新
 });
 ```
 
@@ -148,13 +153,13 @@ renderer.setAnimationLoop((time, frame) => {
   - `MAIN` チャンク（ルート）: content 0 byte、children にモデル群とパレット
 - **チャンク共通フォーマット**（すべてリトルエンディアン）:
 
-  | フィールド | 型 | 説明 |
-  |---|---|---|
-  | chunk id | char[4] | 例 `'SIZE'`, `'XYZI'`, `'RGBA'`, `'PACK'`, `'MAIN'` |
-  | numBytesContent (N) | int32 | 本体バイト数 |
-  | numBytesChildren (M) | int32 | 子チャンク合計バイト数 |
-  | content | byte[N] | 本体 |
-  | children | byte[M] | 子チャンク |
+  | フィールド           | 型      | 説明                                                |
+  | -------------------- | ------- | --------------------------------------------------- |
+  | chunk id             | char[4] | 例 `'SIZE'`, `'XYZI'`, `'RGBA'`, `'PACK'`, `'MAIN'` |
+  | numBytesContent (N)  | int32   | 本体バイト数                                        |
+  | numBytesChildren (M) | int32   | 子チャンク合計バイト数                              |
+  | content              | byte[N] | 本体                                                |
+  | children             | byte[M] | 子チャンク                                          |
 
 - `PACK`（任意）: content = `int32 numModels`。無ければモデル数 1。
 - `SIZE`: `int32 x, int32 y, int32 z`（z が重力方向 = 上方向）。**1 モデルあたり各軸 ≤ 256**。
@@ -175,11 +180,13 @@ renderer.setAnimationLoop((time, frame) => {
 ## Q7. 深度 → ワールド座標 逆投影（最重要）
 
 ### 深度値の定義（確定）
+
 - WebXR/ARCore の深度は **カメラ平面からの垂直距離（eye-space の Z 距離）**。ピクセルへ向かうレイの長さ（Euclidean 距離）ではない。
   - depth-sensing 原案 explainer: 「returned depth value is a distance from the camera plane ... it is **not the length of vector aA**」
   - ARCore 公式: 「principal axis に射影した z 座標。レイ長ではない」
 
 ### 利用可能な行列・値（各 `view` について）
+
 - `depthInfo = frame.getDepthInformation(view)`（`XRCPUDepthInformation`）
   - `.width` `.height` `.data`（`luminance-alpha` → `Uint16Array`）`.rawValueToMeters`
   - `.normDepthBufferFromNormView`（`XRRigidTransform`）: 正規化ビュー座標 → 正規化深度バッファ座標 への変換。`.inverse.matrix` で逆変換。
@@ -188,6 +195,7 @@ renderer.setAnimationLoop((time, frame) => {
 - `view.transform.inverse.matrix`: ワールド → eye
 
 ### 逆投影手順（テクセル (c,r) → ワールド点）
+
 ```
 d = raw[c + r*W] * rawValueToMeters            // 垂直深度[m]。0 は欠損 → skip
                                                 // d < dMin(0.3) or d > dMax(5〜8) も skip
@@ -202,6 +210,7 @@ pEye = dir * t                                  // eye 空間の 3D 点（pEye.z
 pWorld = view.transform.matrix * [pEye, 1]      // ワールド座標
 voxelKey = quantize(pWorld / 0.02)              // 2cm 量子化
 ```
+
 - `getDepthInMeters(x, y)`（正規化座標 x,y ∈ [0,1] を取る便利 API）も存在するが、**密な再構成では生バッファを直接走査**する方が速い。逆投影の検証には両者を突き合わせられる。
 - **要実機確認の 2 点**（Phase 3 でキャリブレーション）:
   1. NDC への変換で **y 反転が正しい向きか**（深度バッファ原点が左上、`normDepthBufferFromNormView` の規約に依存）。
@@ -229,17 +238,17 @@ voxelKey = quantize(pWorld / 0.02)              // 2cm 量子化
 
 ## 実機（Pixel 9a）確認が必要な事項 — 一覧
 
-| # | 確認内容 | 確認するフェーズ |
-|---|---|---|
-| R1 | `immersive-ar` + `depth-sensing` が supported と出るか | Phase 1 |
-| R2 | `session.depthUsage` が `cpu-optimized` になるか（ならなければ GPU readback 経路が必要） | Phase 1 |
-| R3 | `session.depthDataFormat`（`luminance-alpha` / `float32`） | Phase 1 |
-| R4 | `depthInfo.width` / `height` の実値と `rawValueToMeters` | Phase 1/2 |
-| R5 | 深度が動くと更新され、近い物ほど明るい等が目視で確認できる | Phase 2 |
-| R6 | 逆投影の y 反転・スケールが正しい（既知距離ターゲットで実寸一致） | Phase 3 |
-| R7 | `camera-access` の許可が通り、色が整合して取れるか | Phase 3 |
-| R8 | 10 万ボクセルで 30fps 維持 | Phase 4 |
-| R9 | 書き出した GLB が実寸・色を保って外部ツールで開けるか | Phase 7 |
+| #   | 確認内容                                                                                 | 確認するフェーズ |
+| --- | ---------------------------------------------------------------------------------------- | ---------------- |
+| R1  | `immersive-ar` + `depth-sensing` が supported と出るか                                   | Phase 1          |
+| R2  | `session.depthUsage` が `cpu-optimized` になるか（ならなければ GPU readback 経路が必要） | Phase 1          |
+| R3  | `session.depthDataFormat`（`luminance-alpha` / `float32`）                               | Phase 1          |
+| R4  | `depthInfo.width` / `height` の実値と `rawValueToMeters`                                 | Phase 1/2        |
+| R5  | 深度が動くと更新され、近い物ほど明るい等が目視で確認できる                               | Phase 2          |
+| R6  | 逆投影の y 反転・スケールが正しい（既知距離ターゲットで実寸一致）                        | Phase 3          |
+| R7  | `camera-access` の許可が通り、色が整合して取れるか                                       | Phase 3          |
+| R8  | 10 万ボクセルで 30fps 維持                                                               | Phase 4          |
+| R9  | 書き出した GLB が実寸・色を保って外部ツールで開けるか                                    | Phase 7          |
 
 ---
 

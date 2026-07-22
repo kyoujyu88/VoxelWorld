@@ -4,13 +4,43 @@
 
 ---
 
+## 2026-07-22 — Phase 1: 環境確認ページ
+
+### 何を
+
+- Vite 6 + TypeScript 5.9(strict) + three.js 0.185 の足場を構築。バージョンを `package.json`/lock に固定。
+- WebXR 能力判定 `src/xr/capabilities.ts`（`evaluateXRSupport` 純関数 + `probeXRSupport`）。
+- AR セッション構築 `src/xr/session.ts`（`buildSessionInit` = depth-sensing 必須 / camera-access・dom-overlay 任意 / cpu-optimized+luminance-alpha 優先）と、深度・カメラの各プローブ。
+- プローブ UI `src/main.ts` + `src/ui/*`：対応判定カード、開始ボタン、dom-overlay のライブパネル（`depthUsage`/`depthDataFormat`/`enabledFeatures`/深度解像度/`rawValueToMeters`/`camera-access` を ~4Hz 更新）、エラーの可視化。
+- Vitest 11 件（capabilities 6 + session 5）。型チェック・ビルド・dev サーバ起動を確認。
+
+### 主要な判断とその理由
+
+1. **セッションを自前 `requestSession` → `renderer.xr.setSession()`**（ARButton 不使用）
+   - 理由: three.js の ARButton は `depthSensing` 設定を注入しないため。調査どおり。
+2. **WebXR 型に依存しすぎない防御的アクセス**（`session.ts` は独自の構造型 + `unknown` 経由）
+   - 理由: `@types/webxr` のバージョン差で depth/camera 型の有無が揺れるため。値を実消費する Phase 3 で厳密型に置き換える。
+3. **ESLint は今は入れない**（strict tsc + Prettier で担保）
+   - 理由: flat-config のバージョン摩擦を避け、Phase 1 を確実に green にするため。必要になった段階で追加。
+4. **camera-access は optionalFeature**
+   - 理由: 色は要件だが、権限拒否でセッションごと失敗させたくない（幾何だけでも開始できるように）。
+
+### 私が検証した / できていないこと
+
+- 検証済み（本環境）: `tsc --noEmit` green、Vitest 11 件 green、`vite build` 成功、dev サーバが 200 で index/TS を配信。
+- 未検証（実機必須）: R1〜R4（`depth-sensing` 実対応 / `depthUsage` / `depthDataFormat` / 深度解像度・`rawValueToMeters`）と R7（camera-access）。→ `docs/PROGRESS.md` の手順で依頼。
+
+---
+
 ## 2026-07-22 — Phase 0: 事前調査
 
 ### 何を
+
 - `docs/` を作成し、`RESEARCH.md` / `ENVIRONMENT.md` / `PROGRESS.md` / `HISTORY.md` を追加。
 - Section 4 の 7 調査項目 + カメラ色取得（camera-access）を一次情報で調査。
 
 ### 主要な判断とその理由
+
 1. **深度は `cpu-optimized` + `luminance-alpha` を第一候補**
    - 理由: ボクセル化は CPU で行うため CPU パスが自然。`luminance-alpha` は唯一サポート保証されるフォーマット。値は `raw * rawValueToMeters` で扱えばフォーマット非依存にできる。
    - リスク対策: 端末が `gpu-optimized` しか許さない場合の GPU readback 経路を設計に含める（実機 R2 で確認）。
@@ -26,5 +56,6 @@
    - 理由: 2026-07 時点の最新安定（`three@0.185.x`）。
 
 ### 未確定 / 持ち越し
+
 - 逆投影の y 規約と実寸スケールは実機キャリブレーション（R6）で確定。
 - `.vox` 複数モデルのワールド配置（拡張チャンク）は MVP スコープ外候補。
