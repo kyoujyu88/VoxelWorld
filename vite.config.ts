@@ -1,10 +1,17 @@
 import { defineConfig } from 'vitest/config';
 
-// WebXR requires a secure context. For on-device testing the recommended path is
-// `adb reverse tcp:5173 tcp:5173` (localhost counts as secure — no cert needed).
-// For LAN/tunnel testing, run mkcert and point server.https at the generated pem/key,
-// or use `cloudflared tunnel --url http://localhost:5173`. See docs/ENVIRONMENT.md.
+// WebXR requires a secure context. Easiest on-device paths:
+//  - GitHub Pages (HTTPS): open https://<user>.github.io/VoxelWorld/ on the phone.
+//  - `adb reverse tcp:5173 tcp:5173` (localhost counts as secure — no cert needed).
+//  - mkcert HTTPS or `cloudflared tunnel --url http://localhost:5173`. See docs/ENVIRONMENT.md.
+
+// The GitHub Pages workflow sets VITE_BASE (e.g. "/VoxelWorld/") so built assets resolve
+// under the project sub-path. Local dev and local builds default to "/".
+declare const process: { env: Record<string, string | undefined> };
+const base = process.env.VITE_BASE ?? '/';
+
 export default defineConfig({
+  base,
   server: {
     host: true, // expose on LAN for mkcert / tunnel testing
     port: 5173,

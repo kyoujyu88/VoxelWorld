@@ -4,6 +4,27 @@
 
 ---
 
+## 2026-07-22 — インフラ: GitHub Pages 自動デプロイ
+
+### 何を
+
+- `.github/workflows/deploy-pages.yml` を追加。`main` への push で「テスト → ビルド → GitHub Pages へデプロイ」を自動実行。
+- `vite.config.ts` に `VITE_BASE` 対応を追加（Pages のサブパス `/VoxelWorld/` で配信、ローカルは `/`）。
+- `docs/ENVIRONMENT.md` の実機確認手順に「方法 A（最推奨・開発機不要）: GitHub Pages」を追加し、adb / mkcert / cloudflared を B〜D に繰り下げ。
+
+### なぜ
+
+- 実機確認で「github のページで開いたが何も表示されない」報告。原因は、リポジトリ画面や未ビルドの生ソースを開いていて **ビルド済みアプリが配信されていない**こと（本アプリは JS が動けば最低限ステータスカードを描画するため、完全な空白＝アセット未ロード＝配信/base 問題）。
+- 恒久対策として、開発機や adb を要さず Pixel から URL を開くだけで確認できる HTTPS ホスティング（GitHub Pages）を用意するのが最善。WebXR の secure context 要件も HTTPS で満たす。
+- PR #1 はマージ済みのため、本作業はブランチを `main` から作り直した新規 PR として起票（マージ済み履歴に積まない運用に準拠）。
+
+### 検証
+
+- ローカル: `tsc --noEmit` green、`VITE_BASE=/VoxelWorld/ vite build` がアセットを `/VoxelWorld/assets/...` に解決、ワークフロー YAML の妥当性を確認。
+- 未検証: 実際の Actions 実行と Pages 公開 URL の応答（マージ後に GitHub MCP で監視・確認する）。
+
+---
+
 ## 2026-07-22 — Phase 1: 環境確認ページ
 
 ### 何を

@@ -30,14 +30,17 @@
 
 ## 現在のブロッカー / 要判断
 
-1. **Phase 1 実機確認待ち**: `adb reverse` 等で Pixel 9a から開き、R1〜R4（`depth-sensing` 可否 / `depthUsage` / `depthDataFormat` / 深度解像度・`rawValueToMeters`）の結果を返してほしい。手順は `docs/ENVIRONMENT.md` 3 節。
+1. **Phase 1 実機確認待ち**: 下記手順（GitHub Pages）で Pixel 9a から開き、R1〜R4 と R7 の値を返してほしい。
 2. **色の方針（Phase 3）**: camera-access で実色を取る方針で確定（承認済み）。camera-access が実機で拒否/不安定なら高さカラーマップにフォールバック。
+3. **ホスティング**: GitHub Pages 自動デプロイを追加（`.github/workflows/deploy-pages.yml`）。初回のみ Settings → Pages → Source =「GitHub Actions」が要る場合あり。
 
-## Phase 1 実機確認手順（このコミットで動く）
+## Phase 1 実機確認手順（GitHub Pages — 開発機不要）
 
-1. 開発機で `npm install && npm run dev`
-2. Pixel 9a を USB 接続し `adb reverse tcp:5173 tcp:5173`
-3. Pixel の Chrome で `http://localhost:5173` を開く
-4. 「AR 準備完了」と表示され、緑の OK バッジが出れば **R1 合格**
-5. 「AR + 深度センシングを開始」を押し、権限を許可 → 端末をゆっくり動かす
-6. 下部パネルの `depthUsage` / `depthDataFormat` / 深度バッファ解像度 / `rawValueToMeters` / `camera-access` の値をスクショまたはテキストで返す（R2〜R4, R7 の一次データ）
+1. この変更を `main` にマージ（Actions が自動ビルド＆デプロイ）
+2. Actions タブ →「Deploy to GitHub Pages」が緑になるまで待つ（初回は Pages 有効化が要る場合あり）
+3. Pixel 9a の Chrome で **`https://kyoujyu88.github.io/VoxelWorld/`**（末尾スラッシュ必須）を開く
+4. 「AR 準備完了」＋緑の OK バッジが出れば **R1 合格**
+5. 「AR + 深度センシングを開始」→ 権限許可 → 端末をゆっくり動かす
+6. 下部パネルの `depthUsage` / `depthDataFormat` / 深度バッファ解像度 / `rawValueToMeters` / `camera-access` をスクショまたはテキストで返す（R2〜R4, R7）
+
+> 開発機がある場合は `docs/ENVIRONMENT.md` の方法 B（`adb reverse` + `npm run dev`）でも確認できる。
