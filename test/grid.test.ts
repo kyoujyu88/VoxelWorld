@@ -1,0 +1,91 @@
+import { describe, it, expect } from 'vitest';
+import { VoxelGrid, packKey, unpackKey, type VoxelView } from '../src/voxel/grid';
+
+describe('packKey / unpackKey', () => {
+  it('round-trips positive, negative, and zero coordinates', () => {
+    const cases: Array<[number, number, number]> = [
+      [0, 0, 0],
+      [1, -2, 3],
+      [-100, 200, -300],
+      [65535, -65536, 12345],
+    ];
+    for (const [x, y, z] of cases) {
+      const key = packKey(x, y, z);
+      expect(key).not.toBeNull();
+      expect(unpackKey(key as number)).toEqual({ xi: x, yi: y, zi: z });
+    }
+  });
+
+  it('returns null out of range', () => {
+    expect(packKey(70000, 0, 0)).toBeNull();
+    expect(packKey(0, -70000, 0)).toBeNull();
+  });
+
+  it('gives distinct keys to distinct coordinates', () => {
+    expect(packKey(1, 2, 3)).not.toBe(packKey(3, 2, 1));
+  });
+});
+
+describe('VoxelGrid', () => {
+  it('quantizes points into one 2cm cell and averages color', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
+    g.addPoint(0.01, 0.019, 0.005, 0, 300, 0);
+    g.addPoint(0.019, 0.0, 0.019, 0, 0, 300);
+    expect(g.size).toBe(1);
+
+    const views: VoxelView[] = [];
+    g.forEach(1, (v) => views.push(v));
+    expect(views).toHaveLength(1);
+    expect(views[0].count).toBe(3);
+    expect(views[0].r).toBeCloseTo(100, 6);
+    expect(views[0].g).toBeCloseTo(100, 6);
+    expect(views[0].b).toBeCloseTo(100, 6);
+    expect(views[0].cx).toBeCloseTo(0.01, 6); // cell (0,0,0) center
+    expect(views[0].cy).toBeCloseTo(0.01, 6);
+    expect(views[0].cz).toBeCloseTo(0.01, 6);
+  });
+
+  it('separates points that fall in different cells', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.0, 0, 0, 1, 1, 1);
+    g.addPoint(0.05, 0, 0, 1, 1, 1); // x cell 2
+    expect(g.size).toBe(2);
+  });
+
+  it('filters by minObservations', () => {
+    const g = new VoxelGrid();
+    g.addPoint(0, 0, 0, 10, 10, 10); // count 1
+    g.addPoint(1, 1, 1, 20, 20, 20);
+    g.addPoint(1, 1, 1, 20, 20, 20); // count 2
+    expect(g.countConfident(2)).toBe(1);
+    const seen: VoxelView[] = [];
+    g.forEach(2, (v) => seen.push(v));
+    expect(seen).toHaveLength(1);
+  });
+
+  it('respects maxVoxels but still accumulates into existing cells', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 2 });
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.addPoint(1, 0, 0, 1, 1, 1);
+    g.addPoint(2, 0, 0, 1, 1, 1); // 3rd distinct cell -> dropped
+    expect(g.size).toBe(2);
+    expect(g.droppedAtCap).toBe(1);
+    g.addPoint(0.001, 0, 0, 1, 1, 1); // existing cell (0,0,0)
+    expect(g.size).toBe(2);
+  });
+
+  it('ignores non-finite points', () => {
+    const g = new VoxelGrid();
+    g.addPoint(NaN, 0, 0, 1, 1, 1);
+    g.addPoint(0, Infinity, 0, 1, 1, 1);
+    expect(g.size).toBe(0);
+  });
+
+  it('clears all cells', () => {
+    const g = new VoxelGrid();
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.clear();
+    expect(g.size).toBe(0);
+  });
+});

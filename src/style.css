@@ -221,6 +221,30 @@ table.kv td {
   word-break: break-word;
 }
 
-.hud button.ghost {
-  margin-top: 12px;
+.controls {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 8px;
+  margin-top: 10px;
+}
+
+button.ctl {
+  appearance: none;
+  border: 1px solid #3a4450;
+  border-radius: 8px;
+  background: #20262f;
+  color: var(--text);
+  padding: 8px 12px;
+  font-size: 14px;
+  cursor: pointer;
+  flex: 1 1 auto;
+}
+
+button.ctl:active {
+  background: #2a323d;
+}
+
+.controls button.ghost {
+  margin-top: 0;
+  flex: 1 1 100%;
 }
