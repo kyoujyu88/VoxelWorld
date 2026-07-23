@@ -23,8 +23,10 @@ const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and s
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
 const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
-const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; full grid sweep each time)
+const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
+const DOWNSAMPLE_MS = 400; // coarse-mode (factor > 1) mesh re-tessellation cadence while scanning
+const MAX_FACTOR = 8; // display voxel size up to 8× base = 16 cm
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
 const RENDER_CAP = 150_000;
@@ -41,6 +43,7 @@ interface ScanState {
   colorMode: ColorMode;
   camFlipX: boolean;
   camFlipY: boolean;
+  displayFactor: number; // display/export voxel size = displayFactor × base (2cm); 1 = live 2cm
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -49,7 +52,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 5: 画面レイアウト — 上半分で AR スキャン、下半分に俯瞰ボクセルプレビュー。スキャンしながら結果が育つのを同時に見られます。',
+        'Phase 6: ボクセルサイズ可変 — 上で AR スキャン、下に俯瞰プレビュー。表示サイズスライダーで再スキャンなしにボクセルの粗さを変えられます。',
     }),
   ]);
 
@@ -108,6 +111,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     colorMode: 'camera',
     camFlipX: false,
     camFlipY: true,
+    displayFactor: 1,
   };
   const heightColor = new THREE.Color();
   const camRGB: RGB = { r: 0, g: 0, b: 0 };
@@ -117,6 +121,20 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const overheadCanvas = el('canvas', { className: 'overhead' });
   const thumbCanvas = el('canvas', { className: 'cam-thumb', width: CAMERA_W, height: CAMERA_H });
   const statsSlot = el('div', { className: 'stats' });
+  const sizeSlider = el('input', {
+    type: 'range',
+    min: '1',
+    max: String(MAX_FACTOR),
+    step: '1',
+    value: '1',
+    className: 'size-slider',
+  });
+  const sizeLabel = el('span', { className: 'size-label', textContent: '2cm' });
+  const sizeRow = el('div', { className: 'size-row' }, [
+    el('span', { className: 'size-cap', textContent: '表示サイズ' }),
+    sizeSlider,
+    sizeLabel,
+  ]);
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
   const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
   const colorBtn = el('button', { className: 'ctl', textContent: '🎨 色: カメラ' });
@@ -125,10 +143,11 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 5: 上=AR スキャン ／ 下=俯瞰プレビュー',
+      textContent: 'Phase 6: ボクセルサイズ可変（表示スライダー）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
+    sizeRow,
     el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
@@ -160,6 +179,25 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       state.camFlipX = false;
     } else {
       state.camFlipY = true;
+    }
+  });
+
+  // Display voxel size = factor × 2cm. Dragging shows the target size; releasing re-tessellates
+  // the 3D display from the existing grid — no re-scan (Phase 6 completion condition).
+  const readFactor = (): number =>
+    Math.min(MAX_FACTOR, Math.max(1, parseInt(sizeSlider.value, 10) || 1));
+  sizeSlider.addEventListener('input', () => {
+    sizeLabel.textContent = `${readFactor() * 2}cm`;
+  });
+  sizeSlider.addEventListener('change', () => {
+    const f = readFactor();
+    state.displayFactor = f;
+    sizeLabel.textContent = `${f * 2}cm`;
+    if (f === 1) {
+      voxels.reset();
+      grid.markAllDirty(); // the next applyUpdates() re-seeds every cell at base 2cm
+    } else {
+      voxels.rebuildDownsampled(grid, f, MIN_OBS);
     }
   });
 
@@ -209,7 +247,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   let lastStats = 0;
   let lastPreview = 0;
   let lastCamera = 0;
-  let rendered = 0;
+  let lastRebuild = 0;
   let latestDepth: CpuDepthFrame | null = null;
   let frameCount = 0;
   let fpsWindowStart = 0;
@@ -272,10 +310,16 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       );
     }
 
-    // Cheap incremental append every frame (only newly-confident voxels are uploaded).
-    rendered = voxels.applyUpdates(grid, MIN_OBS);
+    // 3D voxel display. Base size (2cm) is incremental every frame; coarser display sizes
+    // re-tessellate on a throttle while scanning (and immediately on a slider change).
+    if (state.displayFactor === 1) {
+      voxels.applyUpdates(grid, MIN_OBS);
+    } else if (state.accumulating && time - lastRebuild >= DOWNSAMPLE_MS) {
+      lastRebuild = time;
+      voxels.rebuildDownsampled(grid, state.displayFactor, MIN_OBS);
+    }
 
-    // Overhead preview (bottom half): a full but throttled top-down redraw so the map
+    // Overhead preview (bottom half, always base 2cm): incremental top-down redraw so the map
     // visibly grows while the AR view scans on top.
     if (time - lastPreview >= PREVIEW_MS) {
       lastPreview = time;
@@ -288,7 +332,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       frameCount = 0;
       fpsWindowStart = time;
       lastStats = time;
-      updateStats(statsSlot, info, state, grid, rendered, latestDepth, cameraReader, fps);
+      updateStats(statsSlot, info, state, grid, voxels.drawn, latestDepth, cameraReader, fps);
       drawThumbnail(thumbCanvas, cameraReader);
     }
   });
@@ -344,6 +388,10 @@ function updateStats(
     { label: 'FPS', value: fps > 0 ? fps.toFixed(0) : '—' },
     { label: '状態', value: state.accumulating ? '● 蓄積中' : '❚❚ 一時停止' },
     { label: 'ボクセル(2cm)', value: `${grid.size.toLocaleString()} セル` },
+    {
+      label: '表示サイズ',
+      value: `${state.displayFactor * 2}cm${state.displayFactor > 1 ? ` (×${state.displayFactor})` : ''}`,
+    },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
     { label: '色', value: colorStatus },
     {
