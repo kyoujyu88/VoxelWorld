@@ -4,6 +4,35 @@
 
 ---
 
+## 2026-07-23 — Phase 4: 描画最適化（差分追記 + FPS メータ）（+ Phase 3 実機合格）
+
+### Phase 3b 実機合格（R7 確定）
+
+カメラ実色 readback が実機で動作。ボクセルが**実物の色**で着色され、サムネイルにカメラ縮小画像が表示（readback 成功）。色の向きは **X:正 / Y:反転**（`camFlipX=false` / `camFlipY=true`）で実物と整合することをユーザがスクショで確認 → **R7 合格**。これで Phase 3（深度→ワールド→2cm ボクセル→実色）は幾何(R6)・色(R7)ともに実機確認済みで**完了**。
+
+### 何を（Phase 4）
+
+- `src/voxel/grid.ts`: 変更セル追跡を追加。`addPoint` が触れたキーを `dirty: Set<number>` に記録。`drainDirty(cb)` で「前回以降に変化したキーだけ」を走査してクリア（無割り当て）。`readVoxel(key, out)` で 1 セルのワールド中心+平均色+観測数を `out` に詰めて返す（`forEach` の全走査を使わず 1 セルだけ読む経路）。`clear()` は dirty も消す。
+- `src/render/voxelRenderer.ts`: 毎フレーム全再構築を廃止し、**追記専用**に書き換え。`applyUpdates(grid, minObs)` が dirty セルだけを見て、新たに閾値到達した未描画セルを InstancedMesh 末尾に追記。`keyToInstance` で二重追加を防止。追記した連続範囲のみ `instanceMatrix.addUpdateRange(start*16, added*16)` / `instanceColor.addUpdateRange(start*3, added*3)` で部分アップロードし、`mesh.count` を伸ばす。`reset()` でクリア（クリアボタン用）。
+- `src/main.ts`: ループを差分駆動に。毎フレーム `voxels.applyUpdates(grid, MIN_OBS)`（O(変化数)）。`REBUILD_MS`(全再構築間引き) を廃し、`STATS_MS`(250ms) の統計間引きへ。`frameCount` を数え `fps = frameCount*1000/経過` を算出、HUD 一行目に `FPS` を表示。「クリア」は `grid.clear()` + `voxels.reset()`。
+- `test/grid.test.ts`: dirty 追跡と `readVoxel` に 4 件追加（drainDirty は各セル 1 回→クリア / readVoxel の中心・平均色・観測数 / 不在キー→false / clear で dirty 空）。計 **36** 件。
+
+### 主要な判断とその理由
+
+1. **全再構築 → dirty 差分の追記専用に**
+   - 理由: 旧実装は `forEach` で毎回グリッド全セルを走査し InstancedMesh を作り直していた（O(グリッド全体)/更新）。10 万規模では毎回 10 万走査で 30fps を割る。ボクセルは基本「増える一方」なので、変化セルだけ追記すれば更新コストは O(変化数) に落ちる。GPU 転送も追記分の連続範囲だけに絞れる（`addUpdateRange`）。
+2. **既存インスタンスは「最初に閾値到達した時の色」で固定**
+   - 理由: 追記専用にすると既存ボクセルの色は更新されない。だが色の**真の移動平均は grid 側が保持**し続けるので、エクスポート（Phase 7）は正しい平均色を出せる。表示は速度優先で固定色にし、正確さは内部表現に委ねる（表示と内部の分離という設計方針に一致）。
+3. **色の再描画はしない（差分は追記のみ）**
+   - 理由: 「色を後から更新」まで差分に含めると dirty セルごとに `setColorAt` の再アップロードが要り、動く物体で発火し続ける。MVP の完了条件は「30fps 維持」なので、まず追記のみで実現。色更新の増分は必要になった段階で検討。
+
+### 検証
+
+- ローカル: `tsc --noEmit` green、Vitest **36** green、`vite build` 成功（`__BUILD_ID__` 置換確認）。
+- 未確認（実機）: R8（10 万ボクセルで FPS≥30 維持）。→ `docs/PROGRESS.md` の Phase 4 手順で依頼。
+
+---
+
 ## 2026-07-23 — Phase 3b: カメラ実色 + ビルド表示（+ Phase 3.1 実機確認）
 
 ### Phase 3.1 実機確認（?v=2 で新版）

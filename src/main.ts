@@ -21,7 +21,7 @@ const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accura
 const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and spurious voxels
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
 const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
-const REBUILD_MS = 250; // InstancedMesh rebuild cadence
+const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
@@ -134,7 +134,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   });
   clearBtn.addEventListener('click', () => {
     grid.clear();
-    voxels.rebuild(grid, MIN_OBS);
+    voxels.reset();
   });
   colorBtn.addEventListener('click', () => {
     state.colorMode = state.colorMode === 'camera' ? 'height' : 'camera';
@@ -196,10 +196,13 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   }
 
   const info: SessionInfo = readSessionInfo(session);
-  let lastRebuild = 0;
+  let lastStats = 0;
   let lastCamera = 0;
   let rendered = 0;
   let latestDepth: CpuDepthFrame | null = null;
+  let frameCount = 0;
+  let fpsWindowStart = 0;
+  let fps = 0;
 
   const accumulate = (x: number, y: number, z: number, u: number, v: number): void => {
     if (
@@ -218,6 +221,13 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
     renderer.render(scene, camera);
+    // Seed the FPS window on the first frame (WebXR `time` is page-load-relative, not 0),
+    // so the first reading isn't frameCount/absoluteTime garbage.
+    if (fpsWindowStart === 0) {
+      fpsWindowStart = time;
+      lastStats = time;
+    }
+    frameCount++;
     if (!frame) return;
 
     const refSpace = renderer.xr.getReferenceSpace();
@@ -251,10 +261,16 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       );
     }
 
-    if (time - lastRebuild >= REBUILD_MS) {
-      lastRebuild = time;
-      rendered = voxels.rebuild(grid, MIN_OBS);
-      updateStats(statsSlot, info, state, grid, rendered, latestDepth, cameraReader);
+    // Cheap incremental append every frame (only newly-confident voxels are uploaded).
+    rendered = voxels.applyUpdates(grid, MIN_OBS);
+
+    if (time - lastStats >= STATS_MS) {
+      const dt = time - fpsWindowStart;
+      fps = dt > 0 ? (frameCount * 1000) / dt : 0;
+      frameCount = 0;
+      fpsWindowStart = time;
+      lastStats = time;
+      updateStats(statsSlot, info, state, grid, rendered, latestDepth, cameraReader, fps);
       drawThumbnail(thumbCanvas, cameraReader);
     }
   });
@@ -293,6 +309,7 @@ function updateStats(
   rendered: number,
   depth: CpuDepthFrame | null,
   reader: CameraColorReader | null,
+  fps: number,
 ): void {
   const colorStatus =
     state.colorMode === 'height'
@@ -306,6 +323,7 @@ function updateStats(
             : 'カメラ(待機)';
 
   const rows: KV[] = [
+    { label: 'FPS', value: fps > 0 ? fps.toFixed(0) : '—' },
     { label: '状態', value: state.accumulating ? '● 蓄積中' : '❚❚ 一時停止' },
     { label: 'ボクセル(2cm)', value: `${grid.size.toLocaleString()} セル` },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },

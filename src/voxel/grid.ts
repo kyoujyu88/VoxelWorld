@@ -64,6 +64,8 @@ export class VoxelGrid {
   readonly voxelSize: number;
   readonly maxVoxels: number;
   private readonly cells = new Map<number, VoxelRecord>();
+  /** Keys touched since the last drainDirty() — lets the renderer update incrementally. */
+  private readonly dirty = new Set<number>();
   /** Incremented whenever a cell is skipped because the cap was reached (for reporting). */
   droppedAtCap = 0;
 
@@ -98,11 +100,35 @@ export class VoxelGrid {
     rec.rSum += r;
     rec.gSum += g;
     rec.bSum += b;
+    this.dirty.add(key);
   }
 
   clear(): void {
     this.cells.clear();
+    this.dirty.clear();
     this.droppedAtCap = 0;
+  }
+
+  /** Visit every key changed since the last call, then clear the dirty set (no allocation). */
+  drainDirty(cb: (key: number) => void): void {
+    for (const key of this.dirty) cb(key);
+    this.dirty.clear();
+  }
+
+  /** Fill `out` with a cell's world-center + mean color + count. Returns false if absent. */
+  readVoxel(key: number, out: VoxelView): boolean {
+    const rec = this.cells.get(key);
+    if (rec === undefined) return false;
+    const { xi, yi, zi } = unpackKey(key);
+    const half = this.voxelSize * 0.5;
+    out.cx = xi * this.voxelSize + half;
+    out.cy = yi * this.voxelSize + half;
+    out.cz = zi * this.voxelSize + half;
+    out.r = rec.rSum / rec.count;
+    out.g = rec.gSum / rec.count;
+    out.b = rec.bSum / rec.count;
+    out.count = rec.count;
+    return true;
   }
 
   /** Number of cells observed at least `minObservations` times. */

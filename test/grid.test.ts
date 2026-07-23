@@ -89,3 +89,49 @@ describe('VoxelGrid', () => {
     expect(g.size).toBe(0);
   });
 });
+
+describe('VoxelGrid dirty tracking + readVoxel', () => {
+  const emptyView = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 });
+
+  it('drainDirty yields each touched cell once, then clears', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.addPoint(0.001, 0, 0, 1, 1, 1); // same cell
+    g.addPoint(0.05, 0, 0, 1, 1, 1); // different cell
+    const first: number[] = [];
+    g.drainDirty((k) => first.push(k));
+    expect(first).toHaveLength(2);
+    const second: number[] = [];
+    g.drainDirty((k) => second.push(k));
+    expect(second).toHaveLength(0);
+  });
+
+  it('readVoxel fills world-center + mean color + count', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
+    g.addPoint(0.01, 0.01, 0.01, 0, 0, 0); // same cell (0,0,0)
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    const out = emptyView();
+    expect(g.readVoxel(key, out)).toBe(true);
+    expect(out.count).toBe(2);
+    expect(out.r).toBeCloseTo(150, 6);
+    expect(out.cx).toBeCloseTo(0.01, 6);
+  });
+
+  it('readVoxel returns false for an absent key', () => {
+    const g = new VoxelGrid();
+    expect(g.readVoxel(123456, emptyView())).toBe(false);
+  });
+
+  it('clear() empties the dirty set', () => {
+    const g = new VoxelGrid();
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.clear();
+    const keys: number[] = [];
+    g.drainDirty((k) => keys.push(k));
+    expect(keys).toHaveLength(0);
+  });
+});
