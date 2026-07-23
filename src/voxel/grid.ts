@@ -36,8 +36,9 @@ export function unpackKey(key: number): { xi: number; yi: number; zi: number } {
 }
 
 export interface VoxelRecord {
-  count: number;
-  rSum: number;
+  count: number; // raw observation count (drives the minObservations occupancy threshold)
+  wSum: number; // sum of observation weights; color is weighted (nearer views count more)
+  rSum: number; // sum of color × weight
   gSum: number;
   bSum: number;
 }
@@ -88,9 +89,15 @@ export class VoxelGrid {
     return this.cells.size;
   }
 
-  /** Quantize and accumulate a colored world point. Colors are 0..255. */
-  addPoint(x: number, y: number, z: number, r: number, g: number, b: number): void {
+  /**
+   * Quantize and accumulate a colored world point. Colors are 0..255. `weight` (default 1) lets
+   * the caller value nearer, more accurate observations more heavily — the stored color is the
+   * weight-weighted mean, so revisiting a cell from close up pulls its color toward the accurate
+   * one. The occupancy count is the raw hit count and ignores the weight.
+   */
+  addPoint(x: number, y: number, z: number, r: number, g: number, b: number, weight = 1): void {
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
+    const w = weight > 0 ? weight : 1;
     const xi = Math.floor(x / this.voxelSize);
     const yi = Math.floor(y / this.voxelSize);
     const zi = Math.floor(z / this.voxelSize);
@@ -103,13 +110,14 @@ export class VoxelGrid {
         this.droppedAtCap++;
         return;
       }
-      rec = { count: 0, rSum: 0, gSum: 0, bSum: 0 };
+      rec = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0 };
       this.cells.set(key, rec);
     }
     rec.count++;
-    rec.rSum += r;
-    rec.gSum += g;
-    rec.bSum += b;
+    rec.wSum += w;
+    rec.rSum += r * w;
+    rec.gSum += g * w;
+    rec.bSum += b * w;
     if (!this.hasCells) {
       this.hasCells = true;
       this.minXi = this.maxXi = xi;
@@ -138,6 +146,11 @@ export class VoxelGrid {
   /** Visit every key changed since the last call, then clear the dirty set (no allocation). */
   drainDirty(cb: (key: number) => void): void {
     for (const key of this.dirty) cb(key);
+    this.dirty.clear();
+  }
+
+  /** Discard the renderer's pending dirty keys without visiting them (used in coarse mode). */
+  clearDirty(): void {
     this.dirty.clear();
   }
 
@@ -187,9 +200,9 @@ export class VoxelGrid {
     out.cx = xi * this.voxelSize + half;
     out.cy = yi * this.voxelSize + half;
     out.cz = zi * this.voxelSize + half;
-    out.r = rec.rSum / rec.count;
-    out.g = rec.gSum / rec.count;
-    out.b = rec.bSum / rec.count;
+    out.r = rec.rSum / rec.wSum;
+    out.g = rec.gSum / rec.wSum;
+    out.b = rec.bSum / rec.wSum;
     out.count = rec.count;
     return true;
   }
@@ -213,9 +226,9 @@ export class VoxelGrid {
         cx: xi * this.voxelSize + half,
         cy: yi * this.voxelSize + half,
         cz: zi * this.voxelSize + half,
-        r: rec.rSum / rec.count,
-        g: rec.gSum / rec.count,
-        b: rec.bSum / rec.count,
+        r: rec.rSum / rec.wSum,
+        g: rec.gSum / rec.wSum,
+        b: rec.bSum / rec.wSum,
         count: rec.count,
       });
     }
@@ -239,7 +252,7 @@ export class VoxelGrid {
       const afterZ = (key - z) / BASE;
       const y = afterZ % BASE;
       const x = (afterZ - y) / BASE;
-      const inv = 1 / rec.count;
+      const inv = 1 / rec.wSum;
       cb(
         (x - OFFSET) * s + half,
         (y - OFFSET) * s + half,
@@ -284,10 +297,11 @@ export class VoxelGrid {
       if (ckey === null) continue;
       let c = coarse.get(ckey);
       if (c === undefined) {
-        c = { count: 0, rSum: 0, gSum: 0, bSum: 0 };
+        c = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0 };
         coarse.set(ckey, c);
       }
       c.count += rec.count;
+      c.wSum += rec.wSum;
       c.rSum += rec.rSum;
       c.gSum += rec.gSum;
       c.bSum += rec.bSum;
@@ -296,7 +310,7 @@ export class VoxelGrid {
     const half = coarseSize * 0.5;
     for (const [ckey, c] of coarse) {
       const { xi, yi, zi } = unpackKey(ckey);
-      const inv = 1 / c.count;
+      const inv = 1 / c.wSum;
       cb(
         xi * coarseSize + half,
         yi * coarseSize + half,
