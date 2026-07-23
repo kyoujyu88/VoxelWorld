@@ -25,8 +25,12 @@ export interface ReprojectOptions {
   flipY?: boolean;
 }
 
-/** Called for each reprojected point: world x/y/z plus the source texel column/row. */
-export type PointSink = (x: number, y: number, z: number, col: number, row: number) => void;
+/**
+ * Called for each reprojected point: world x/y/z plus the source texel's normalized view
+ * coordinates (u, v). Because the camera image is aligned to the XRView, (u, v) double as the
+ * camera-image UV for per-voxel color sampling.
+ */
+export type PointSink = (x: number, y: number, z: number, u: number, v: number) => void;
 
 const _ndbToView = new Matrix4();
 const _invProj = new Matrix4();
@@ -80,7 +84,7 @@ export function reprojectDepthFrame(
       // scale so eye-space Z == -d (camera looks down -Z), then eye -> world
       const t = -d / dirZ;
       _world.set(_eye.x * ew * t, _eye.y * ew * t, dirZ * t).applyMatrix4(_viewToWorld);
-      sink(_world.x, _world.y, _world.z, col, row);
+      sink(_world.x, _world.y, _world.z, nvx, nvy);
       emitted++;
     }
   }
