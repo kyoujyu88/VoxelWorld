@@ -66,6 +66,16 @@ export class VoxelGrid {
   private readonly cells = new Map<number, VoxelRecord>();
   /** Keys touched since the last drainDirty() — lets the renderer update incrementally. */
   private readonly dirty = new Set<number>();
+  /** Second dirty set, drained independently by the overhead preview (a separate consumer). */
+  private readonly dirtyPreview = new Set<number>();
+  /** Integer-cell AABB over stored cells (drives the preview fit; reusable for export bbox). */
+  private hasCells = false;
+  private minXi = 0;
+  private maxXi = 0;
+  private minYi = 0;
+  private maxYi = 0;
+  private minZi = 0;
+  private maxZi = 0;
   /** Incremented whenever a cell is skipped because the cap was reached (for reporting). */
   droppedAtCap = 0;
 
@@ -100,12 +110,28 @@ export class VoxelGrid {
     rec.rSum += r;
     rec.gSum += g;
     rec.bSum += b;
+    if (!this.hasCells) {
+      this.hasCells = true;
+      this.minXi = this.maxXi = xi;
+      this.minYi = this.maxYi = yi;
+      this.minZi = this.maxZi = zi;
+    } else {
+      if (xi < this.minXi) this.minXi = xi;
+      else if (xi > this.maxXi) this.maxXi = xi;
+      if (yi < this.minYi) this.minYi = yi;
+      else if (yi > this.maxYi) this.maxYi = yi;
+      if (zi < this.minZi) this.minZi = zi;
+      else if (zi > this.maxZi) this.maxZi = zi;
+    }
     this.dirty.add(key);
+    this.dirtyPreview.add(key);
   }
 
   clear(): void {
     this.cells.clear();
     this.dirty.clear();
+    this.dirtyPreview.clear();
+    this.hasCells = false;
     this.droppedAtCap = 0;
   }
 
@@ -113,6 +139,34 @@ export class VoxelGrid {
   drainDirty(cb: (key: number) => void): void {
     for (const key of this.dirty) cb(key);
     this.dirty.clear();
+  }
+
+  /** Like drainDirty, but for the preview's independent dirty set (a second consumer). */
+  drainDirtyPreview(cb: (key: number) => void): void {
+    for (const key of this.dirtyPreview) cb(key);
+    this.dirtyPreview.clear();
+  }
+
+  /** World-space AABB (meters, at cell centers) over stored cells, or null if empty. */
+  getBounds(): {
+    minX: number;
+    maxX: number;
+    minY: number;
+    maxY: number;
+    minZ: number;
+    maxZ: number;
+  } | null {
+    if (!this.hasCells) return null;
+    const s = this.voxelSize;
+    const half = s * 0.5;
+    return {
+      minX: this.minXi * s + half,
+      maxX: this.maxXi * s + half,
+      minY: this.minYi * s + half,
+      maxY: this.maxYi * s + half,
+      minZ: this.minZi * s + half,
+      maxZ: this.maxZi * s + half,
+    };
   }
 
   /** Fill `out` with a cell's world-center + mean color + count. Returns false if absent. */

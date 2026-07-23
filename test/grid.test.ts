@@ -165,3 +165,43 @@ describe('VoxelGrid.forEachConfidentPoint', () => {
     expect(n).toBe(0);
   });
 });
+
+describe('VoxelGrid bounds + preview dirty set', () => {
+  it('getBounds is null when empty and resets on clear()', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    expect(g.getBounds()).toBeNull();
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    expect(g.getBounds()).not.toBeNull();
+    g.clear();
+    expect(g.getBounds()).toBeNull();
+  });
+
+  it('getBounds spans the world-center AABB of stored cells', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.001, 0.001, 0.001, 1, 1, 1); // cell (0,0,0) -> center 0.01
+    g.addPoint(0.05, 0.09, 0.05, 1, 1, 1); // cell (2,4,2) -> center (0.05,0.09,0.05)
+    const b = g.getBounds();
+    expect(b).not.toBeNull();
+    expect((b as NonNullable<typeof b>).minX).toBeCloseTo(0.01, 6);
+    expect((b as NonNullable<typeof b>).maxX).toBeCloseTo(0.05, 6);
+    expect((b as NonNullable<typeof b>).minY).toBeCloseTo(0.01, 6);
+    expect((b as NonNullable<typeof b>).maxY).toBeCloseTo(0.09, 6);
+    expect((b as NonNullable<typeof b>).minZ).toBeCloseTo(0.01, 6);
+    expect((b as NonNullable<typeof b>).maxZ).toBeCloseTo(0.05, 6);
+  });
+
+  it('drainDirtyPreview is independent of drainDirty and clears after draining', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.addPoint(0.05, 0, 0, 1, 1, 1);
+    // Draining the renderer's dirty set must not empty the preview's set.
+    g.drainDirty(() => {});
+    const previewKeys: number[] = [];
+    g.drainDirtyPreview((k) => previewKeys.push(k));
+    expect(previewKeys).toHaveLength(2);
+    // Second drain is empty.
+    const again: number[] = [];
+    g.drainDirtyPreview((k) => again.push(k));
+    expect(again).toHaveLength(0);
+  });
+});
