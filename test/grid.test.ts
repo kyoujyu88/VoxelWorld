@@ -286,3 +286,34 @@ describe('VoxelGrid proximity-weighted color', () => {
     expect(out.r).toBeCloseTo(150, 6);
   });
 });
+
+describe('VoxelGrid.recordMiss (free-space carving)', () => {
+  const keyOf = (g: VoxelGrid): number => {
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    return key;
+  };
+
+  it('lowers occupancy and reports when it falls below the threshold', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    for (let i = 0; i < 5; i++) g.addPoint(0, 0, 0, 1, 1, 1); // count 5
+    const key = keyOf(g);
+    expect(g.recordMiss(key, 3)).toBe(true); // 5 -> 4
+    expect(g.recordMiss(key, 3)).toBe(true); // 4 -> 3
+    expect(g.recordMiss(key, 3)).toBe(false); // 3 -> 2, below minObs
+    expect(g.size).toBe(1); // cell still present
+  });
+
+  it('deletes the cell once occupancy reaches zero', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0, 0, 0, 1, 1, 1);
+    g.addPoint(0, 0, 0, 1, 1, 1); // count 2
+    const key = keyOf(g);
+    expect(g.recordMiss(key, 3)).toBe(false); // 2 -> 1
+    expect(g.recordMiss(key, 3)).toBe(false); // 1 -> 0 -> deleted
+    expect(g.size).toBe(0);
+    expect(g.recordMiss(key, 3)).toBe(false); // already gone, no throw
+  });
+});
