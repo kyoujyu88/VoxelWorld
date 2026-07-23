@@ -139,33 +139,57 @@ button.ghost {
   height: 100vh;
 }
 
-/* dom-overlay live panel. Phase 5 replaces this with the bottom-half layout. */
 /* dom-overlay root: the UA controls this element's box, so keep it a transparent
-   passthrough and put all visible styling on the inner .hud. */
+   passthrough (top half shows the AR camera + in-world voxels) and put all visible
+   styling on the inner .hud (the opaque bottom half). */
 .xr-overlay {
   position: fixed;
   inset: 0;
   pointer-events: none;
 }
 
-/* Bottom heads-up panel (Phase 5 will grow this into the full bottom-half layout). */
+/* Bottom-half panel (Phase 5): overhead voxel preview + stats + controls, opaque so it
+   reads clearly against the live camera feed showing through the top half. */
 .hud {
   position: fixed;
   left: 0;
   right: 0;
   bottom: 0;
   pointer-events: auto;
-  background: rgba(10, 13, 17, 0.92);
+  background: rgba(10, 13, 17, 0.94);
   border-top: 1px solid #2a323d;
-  padding: 10px 14px calc(12px + env(safe-area-inset-bottom));
+  padding: 8px 12px calc(10px + env(safe-area-inset-bottom));
   max-height: 62vh;
-  overflow: auto;
+  overflow-y: auto;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
 }
 
 .hud-title {
   font-size: 12px;
   color: var(--muted);
-  margin-bottom: 8px;
+}
+
+/* Overhead (top-down) voxel preview — the star of the bottom half. Fixed 3:2 buffer,
+   letterboxed with object-fit so voxels never distort. */
+.overhead-wrap {
+  position: relative;
+  width: 100%;
+  aspect-ratio: 3 / 2;
+  max-height: 42vh;
+  background: #12141a;
+  border: 1px solid #2a323d;
+  border-radius: 8px;
+  overflow: hidden;
+}
+
+.overhead {
+  display: block;
+  width: 100%;
+  height: 100%;
+  object-fit: contain;
+  image-rendering: pixelated;
 }
 
 .depth-canvas {
@@ -196,7 +220,7 @@ button.ghost {
 }
 
 .stats {
-  margin-top: 4px;
+  margin-top: 0;
 }
 
 table.kv {
@@ -219,6 +243,16 @@ table.kv td {
   padding: 4px 0;
   font-variant-numeric: tabular-nums;
   word-break: break-word;
+}
+
+/* In-AR stats sit under the preview, so keep them tight. */
+.hud .stats table.kv {
+  font-size: 12px;
+}
+
+.hud .stats table.kv th,
+.hud .stats table.kv td {
+  padding: 2px 8px 2px 0;
 }
 
 .controls {
@@ -249,25 +283,18 @@ button.ctl:active {
   flex: 1 1 100%;
 }
 
-.hud-row {
-  display: flex;
-  gap: 12px;
-  align-items: flex-start;
-}
-
-.hud-row .stats {
-  flex: 1 1 auto;
-  min-width: 0;
-}
-
+/* Camera-readback thumbnail, overlaid in the preview's top-right corner (color diagnosis). */
 .cam-thumb {
-  flex: 0 0 auto;
-  width: 72px;
+  position: absolute;
+  top: 6px;
+  right: 6px;
+  width: 46px;
   height: auto;
-  border: 1px solid #2a323d;
-  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  border-radius: 4px;
   background: #000;
   image-rendering: auto;
+  opacity: 0.9;
 }
 
 .build-stamp {
