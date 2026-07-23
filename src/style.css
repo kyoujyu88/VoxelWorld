@@ -255,6 +255,35 @@ table.kv td {
   padding: 2px 8px 2px 0;
 }
 
+/* Display voxel-size slider (Phase 6). */
+.size-row {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  font-size: 13px;
+  color: var(--muted);
+}
+
+.size-cap {
+  flex: 0 0 auto;
+  white-space: nowrap;
+}
+
+.size-slider {
+  flex: 1 1 auto;
+  min-width: 0;
+  accent-color: var(--accent);
+  height: 28px;
+}
+
+.size-label {
+  flex: 0 0 auto;
+  min-width: 3.5em;
+  text-align: right;
+  color: var(--text);
+  font-variant-numeric: tabular-nums;
+}
+
 .controls {
   display: flex;
   flex-wrap: wrap;

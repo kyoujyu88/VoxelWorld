@@ -205,3 +205,53 @@ describe('VoxelGrid bounds + preview dirty set', () => {
     expect(again).toHaveLength(0);
   });
 });
+
+describe('VoxelGrid.forEachDownsampled', () => {
+  it('factor 1 reproduces the confident cells', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0, 0, 0, 10, 20, 30);
+    g.addPoint(0, 0, 0, 10, 20, 30);
+    g.addPoint(0.05, 0, 0, 40, 50, 60);
+    g.addPoint(0.05, 0, 0, 40, 50, 60);
+    const confident: number[] = [];
+    g.forEachConfidentPoint(2, (cx) => confident.push(cx));
+    const down: number[] = [];
+    g.forEachDownsampled(1, 2, (cx) => down.push(cx));
+    expect(down.length).toBe(confident.length);
+    expect(down.length).toBe(2);
+  });
+
+  it('factor 2 merges a 2×2×2 block and means the color over all observations', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    // Internal cell (0,0,0): two obs of red (200,0,0).
+    g.addPoint(0.001, 0.001, 0.001, 200, 0, 0);
+    g.addPoint(0.001, 0.001, 0.001, 200, 0, 0);
+    // Internal cell (1,0,0): two obs of black — same coarse cell at factor 2.
+    g.addPoint(0.03, 0.001, 0.001, 0, 0, 0);
+    g.addPoint(0.03, 0.001, 0.001, 0, 0, 0);
+
+    const out: Array<[number, number, number, number, number, number]> = [];
+    g.forEachDownsampled(2, 2, (cx, cy, cz, r, gg, b) => out.push([cx, cy, cz, r, gg, b]));
+    expect(out).toHaveLength(1);
+    const [cx, cy, cz, r, gg, b] = out[0];
+    // Coarse cell (0,0,0), size 0.04 -> center 0.02.
+    expect(cx).toBeCloseTo(0.02, 6);
+    expect(cy).toBeCloseTo(0.02, 6);
+    expect(cz).toBeCloseTo(0.02, 6);
+    // rSum = 200*2 + 0*2 = 400 over count 4 -> 100.
+    expect(r).toBeCloseTo(100, 6);
+    expect(gg).toBeCloseTo(0, 6);
+    expect(b).toBeCloseTo(0, 6);
+  });
+
+  it('factor 2 keeps cells in different coarse blocks separate', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.001, 0, 0, 1, 1, 1);
+    g.addPoint(0.001, 0, 0, 1, 1, 1); // internal (0,0,0) -> coarse (0,0,0)
+    g.addPoint(0.05, 0, 0, 1, 1, 1);
+    g.addPoint(0.05, 0, 0, 1, 1, 1); // internal (2,0,0) -> coarse (1,0,0)
+    let n = 0;
+    g.forEachDownsampled(2, 2, () => n++);
+    expect(n).toBe(2);
+  });
+});

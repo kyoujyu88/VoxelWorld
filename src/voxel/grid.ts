@@ -147,6 +147,15 @@ export class VoxelGrid {
     this.dirtyPreview.clear();
   }
 
+  /**
+   * Mark every stored cell dirty for the renderer, so the next incremental applyUpdates re-adds
+   * them all. Used to re-seed the base-size (2cm) display after switching the size slider back to
+   * 1× (the coarse rebuild had cleared the incremental instance map).
+   */
+  markAllDirty(): void {
+    for (const key of this.cells.keys()) this.dirty.add(key);
+  }
+
   /** World-space AABB (meters, at cell centers) over stored cells, or null if empty. */
   getBounds(): {
     minX: number;
@@ -238,6 +247,63 @@ export class VoxelGrid {
         rec.rSum * inv,
         rec.gSum * inv,
         rec.bSum * inv,
+      );
+    }
+  }
+
+  /**
+   * Aggregate confident 2cm cells into coarser display cells (integer `factor`, so the coarse
+   * size is factor×voxelSize) and yield each occupied coarse cell's world-center + mean color.
+   * `factor = 1` reproduces the confident cells exactly. This is how the display/export gets
+   * re-tessellated at a larger voxel size without re-scanning (Phase 6). Color is the true mean
+   * over all observations in the coarse cell (raw sums are combined, then divided). Allocates a
+   * temp aggregation map per call, so call it on a slider change / throttle, not every frame.
+   */
+  forEachDownsampled(
+    factor: number,
+    minObservations: number,
+    cb: (cx: number, cy: number, cz: number, r: number, g: number, b: number) => void,
+  ): void {
+    const f = Math.max(1, Math.floor(factor));
+    if (f === 1) {
+      this.forEachConfidentPoint(minObservations, cb);
+      return;
+    }
+    const coarse = new Map<number, VoxelRecord>();
+    for (const [key, rec] of this.cells) {
+      if (rec.count < minObservations) continue;
+      const z = key % BASE;
+      const afterZ = (key - z) / BASE;
+      const y = afterZ % BASE;
+      const x = (afterZ - y) / BASE;
+      // Math.floor divides correctly for the negative cell indices too.
+      const cxi = Math.floor((x - OFFSET) / f);
+      const cyi = Math.floor((y - OFFSET) / f);
+      const czi = Math.floor((z - OFFSET) / f);
+      const ckey = packKey(cxi, cyi, czi);
+      if (ckey === null) continue;
+      let c = coarse.get(ckey);
+      if (c === undefined) {
+        c = { count: 0, rSum: 0, gSum: 0, bSum: 0 };
+        coarse.set(ckey, c);
+      }
+      c.count += rec.count;
+      c.rSum += rec.rSum;
+      c.gSum += rec.gSum;
+      c.bSum += rec.bSum;
+    }
+    const coarseSize = f * this.voxelSize;
+    const half = coarseSize * 0.5;
+    for (const [ckey, c] of coarse) {
+      const { xi, yi, zi } = unpackKey(ckey);
+      const inv = 1 / c.count;
+      cb(
+        xi * coarseSize + half,
+        yi * coarseSize + half,
+        zi * coarseSize + half,
+        c.rSum * inv,
+        c.gSum * inv,
+        c.bSum * inv,
       );
     }
   }
