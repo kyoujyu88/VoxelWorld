@@ -4,6 +4,39 @@
 
 ---
 
+## 2026-07-23 — Phase 3b: カメラ実色 + ビルド表示（+ Phase 3.1 実機確認）
+
+### Phase 3.1 実機確認（?v=2 で新版）
+
+ノイズ低減が効いた: `89,036 セル`（前 400k）/ 描画 `48,745`（前 150k）/「破棄」消滅。**椅子・ドア・床がボクセル形状で認識でき整列**、flipY=ON 確定、二重壁は体感なし → **R6 幾何は実機で確認**。ユーザ所感「少し見やすくなった」。横縞は stride2 の密度ムラ（軽微）。残課題は「色が分かりづらい」＝実色化。
+
+（途中、古いキャッシュの旧版を見てしまう事象。原因は GitHub Pages が index.html を ~10 分キャッシュするため。`?v=` で回避できることを確認 → 恒久策として下記ビルド表示を追加。）
+
+### 何を（Phase 3b）
+
+- `src/xr/cameraColor.ts`: `CameraColorReader`。`XRWebGLBinding.getCameraImage(view.camera)` の WebGLTexture を FBO に attach → `blitFramebuffer` で 96x214 に縮小 → `readPixels` で CPU バッファ化（WebGL2）。`sample(u,v)` で正規化ビュー座標から色を引く。全操作を try/catch で保護し、失敗時は `failed` を立てて高さ色にフォールバック（AR 表示は絶対に壊さない）。`flipX/flipY` で色の向きを実機調整。
+- `src/xr/reproject.ts`: `PointSink` を `(x,y,z,u,v)` に拡張（u,v = 正規化ビュー座標 = カメラ画像 UV）。
+- `src/main.ts`: 毎フレーム描画後にカメラ readback（~10Hz スロットル）→ `renderer.resetState()` で three の状態を再同期。ボクセルはカメラ色（失敗/未取得時は高さ色）。操作に「🎨 色: カメラ/高さ」「🔃 色向き(4通り循環)」を追加、`↕上下反転` は flipY=ON 確定のため撤去。HUD にカメラ縮小サムネイル（readback 診断）+ 色状態。
+- `vite.config.ts` + UI: `__BUILD_ID__`（ビルド時刻）を define し、トップページと HUD に `build:` 表示。キャッシュで古い版を見た時に一目で分かる。
+
+### 主要な判断とその理由
+
+1. **色は CPU readback（FBO+blit+readPixels）で取得**
+   - 理由: 色はボクセルごとに移動平均で蓄積・エクスポートするため CPU 値が要る。`getCameraImage` は GPU テクスチャのみなので downscale して readback。full 855x1920 は重いので 96x214 に blit してから読む（GPU stall 低減、~10Hz）。
+2. **徹底したフォールバックと診断**
+   - 理由: readback はブラウザ/端末依存で最も壊れやすい。失敗しても高さ色で動作継続し、AR 表示を壊さない。サムネイル+色状態+色向きトグルで、実機だけで原因切り分け・向き調整ができるようにした（Web 検索はレート制限中のため、確定 API=getCameraImage + 標準 WebGL2 の範囲で実装し、不確実な向きは実機調整に委ねる）。
+3. **ビルド表示の追加**
+   - 理由: 実機テストで旧キャッシュ版を見てしまう事故が起きたため。`build:` 時刻で今の版が一目で分かる。恒久的な自動更新(SW)は複雑さ回避で見送り、`?v=` + 表示で対処。
+4. **`↕上下反転(reproject flipY)` トグルを撤去**
+   - 理由: R6 で flipY=ON が正しいと実機確認できたため、`flipY: true` に固定してボタン枠を色操作へ。
+
+### 検証
+
+- ローカル: `tsc` green、Vitest **32** green、`vite build`（`__BUILD_ID__` 置換を確認）。
+- 未確認（実機）: R7 色（実物色になるか・色の向き・サムネイル・readback 可否）。→ `docs/PROGRESS.md` の Phase 3b 手順で依頼。
+
+---
+
 ## 2026-07-22 — Phase 3.1: ノイズ低減と見やすさ改善
 
 ### Phase 3a 実機フィードバック（スクショ）

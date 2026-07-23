@@ -5,10 +5,13 @@ import { requestArSession, readSessionInfo, type SessionInfo } from './xr/sessio
 import { readCpuDepthFrame, type CpuDepthFrame } from './xr/depth';
 import { reprojectDepthFrame } from './xr/reproject';
 import { computeDepthStats } from './render/depthHeatmap';
+import { CameraColorReader, type RGB } from './xr/cameraColor';
 import { VoxelGrid } from './voxel/grid';
 import { VoxelRenderer } from './render/voxelRenderer';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { el, clear } from './ui/dom';
+
+declare const __BUILD_ID__: string;
 
 const app = document.querySelector<HTMLDivElement>('#app');
 if (!app) throw new Error('#app container not found');
@@ -19,16 +22,23 @@ const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and s
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
 const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
 const REBUILD_MS = 250; // InstancedMesh rebuild cadence
+const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
+const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
+const CAMERA_H = 214;
 const RENDER_CAP = 150_000;
 const GRID_CAP = 600_000;
 
-// Temporary height-based color window (local-space Y), floor..ceiling. Replaced by camera color next.
+// Height-based fallback color window (local-space Y), floor..ceiling.
 const HEIGHT_LO = -1.3;
 const HEIGHT_HI = 1.7;
 
+type ColorMode = 'camera' | 'height';
+
 interface ScanState {
   accumulating: boolean;
-  flipY: boolean; // NDC y convention; toggle on-device to calibrate reprojection (R6)
+  colorMode: ColorMode;
+  camFlipX: boolean;
+  camFlipY: boolean;
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -37,14 +47,15 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 3: ボクセル蓄積 — 深度をワールド座標へ逆投影し 2cm グリッドに蓄積します。',
+        'Phase 3: ボクセル蓄積 — 深度を逆投影し 2cm グリッドに蓄積、カメラ実色で着色します。',
     }),
   ]);
 
   const statusSlot = el('div', { className: 'slot' });
   const actionSlot = el('div', { className: 'slot' });
   const errorSlot = el('div', { className: 'slot' });
-  app.append(header, statusSlot, actionSlot, errorSlot);
+  const buildFooter = el('p', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` });
+  app.append(header, statusSlot, actionSlot, errorSlot, buildFooter);
 
   const status = await probeXRSupport();
   statusSlot.append(renderCapabilityStatus(status));
@@ -61,7 +72,7 @@ async function main(app: HTMLDivElement): Promise<void> {
       el('p', {
         className: 'hint',
         textContent:
-          '開始後、端末をゆっくり動かすと、見た面にボクセルが積もっていきます。色は暫定で高さ表示です（実色は次段）。',
+          '開始後、端末をゆっくり動かすと見た面にボクセルが積もります。色はカメラ映像から取得します（失敗時は高さ色）。',
       }),
     );
   }
@@ -90,20 +101,29 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const voxels = new VoxelRenderer(RENDER_CAP, VOXEL_SIZE);
   scene.add(voxels.mesh);
 
-  const state: ScanState = { accumulating: true, flipY: true };
+  const state: ScanState = {
+    accumulating: true,
+    colorMode: 'camera',
+    camFlipX: false,
+    camFlipY: true,
+  };
   const heightColor = new THREE.Color();
+  const camRGB: RGB = { r: 0, g: 0, b: 0 };
 
   const overlay = el('div', { className: 'xr-overlay' });
   const hud = el('div', { className: 'hud' });
+  const thumbCanvas = el('canvas', { className: 'cam-thumb', width: CAMERA_W, height: CAMERA_H });
   const statsSlot = el('div', { className: 'stats' });
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
   const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
-  const flipBtn = el('button', { className: 'ctl', textContent: '↕ 上下反転' });
+  const colorBtn = el('button', { className: 'ctl', textContent: '🎨 色: カメラ' });
+  const flipBtn = el('button', { className: 'ctl', textContent: '🔃 色向き' });
   const endBtn = el('button', { className: 'ghost', textContent: 'AR を終了' });
   hud.append(
-    el('div', { className: 'hud-title', textContent: 'Phase 3: ボクセル蓄積（色は暫定＝高さ）' }),
-    statsSlot,
-    el('div', { className: 'controls' }, [pauseBtn, clearBtn, flipBtn, endBtn]),
+    el('div', { className: 'hud-title', textContent: 'Phase 3: ボクセル蓄積（カメラ実色）' }),
+    el('div', { className: 'hud-row' }, [statsSlot, thumbCanvas]),
+    el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
+    el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
   overlay.append(hud);
   document.body.append(overlay);
@@ -116,12 +136,28 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     grid.clear();
     voxels.rebuild(grid, MIN_OBS);
   });
-  flipBtn.addEventListener('click', () => {
-    state.flipY = !state.flipY;
+  colorBtn.addEventListener('click', () => {
+    state.colorMode = state.colorMode === 'camera' ? 'height' : 'camera';
+    colorBtn.textContent = state.colorMode === 'camera' ? '🎨 色: カメラ' : '🎨 色: 高さ';
   });
+  // Cycle the 4 camera-UV orientations so the correct one can be found on-device.
+  flipBtn.addEventListener('click', () => {
+    if (!state.camFlipX && state.camFlipY) {
+      state.camFlipX = true;
+    } else if (state.camFlipX && state.camFlipY) {
+      state.camFlipY = false;
+    } else if (state.camFlipX && !state.camFlipY) {
+      state.camFlipX = false;
+    } else {
+      state.camFlipY = true;
+    }
+  });
+
+  let cameraReader: CameraColorReader | null = null;
 
   const cleanup = (): void => {
     renderer.setAnimationLoop(null);
+    cameraReader?.dispose();
     renderer.domElement.remove();
     overlay.remove();
     voxels.dispose();
@@ -149,14 +185,32 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     return;
   }
 
+  const gl = renderer.getContext();
+  if (gl instanceof WebGL2RenderingContext) {
+    cameraReader = new CameraColorReader(session, gl, {
+      targetWidth: CAMERA_W,
+      targetHeight: CAMERA_H,
+      flipX: state.camFlipX,
+      flipY: state.camFlipY,
+    });
+  }
+
   const info: SessionInfo = readSessionInfo(session);
   let lastRebuild = 0;
+  let lastCamera = 0;
   let rendered = 0;
   let latestDepth: CpuDepthFrame | null = null;
 
-  // Temporary height-based color (real camera color is the next increment). No allocation.
-  // Wide, saturated band: low(floor)=blue → mid=green → high(ceiling)=red.
-  const accumulate = (x: number, y: number, z: number): void => {
+  const accumulate = (x: number, y: number, z: number, u: number, v: number): void => {
+    if (
+      state.colorMode === 'camera' &&
+      cameraReader !== null &&
+      !cameraReader.failed &&
+      cameraReader.sample(u, v, camRGB)
+    ) {
+      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b);
+      return;
+    }
     const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
     heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
     grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255);
@@ -173,12 +227,26 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     const view = pose.views[0];
     latestDepth = readCpuDepthFrame(frame, view);
 
+    // Throttled camera readback (raw GL), then resync three's tracked state.
+    if (
+      cameraReader !== null &&
+      !cameraReader.failed &&
+      state.colorMode === 'camera' &&
+      time - lastCamera >= CAMERA_MS
+    ) {
+      lastCamera = time;
+      cameraReader.flipX = state.camFlipX;
+      cameraReader.flipY = state.camFlipY;
+      cameraReader.update(view);
+      renderer.resetState();
+    }
+
     if (latestDepth && state.accumulating) {
       reprojectDepthFrame(
         latestDepth,
         view.projectionMatrix,
         view.transform.matrix,
-        { minMeters: MIN_M, maxMeters: MAX_M, stride: STRIDE, flipY: state.flipY },
+        { minMeters: MIN_M, maxMeters: MAX_M, stride: STRIDE, flipY: true },
         accumulate,
       );
     }
@@ -186,9 +254,35 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     if (time - lastRebuild >= REBUILD_MS) {
       lastRebuild = time;
       rendered = voxels.rebuild(grid, MIN_OBS);
-      updateStats(statsSlot, info, state, grid, rendered, latestDepth);
+      updateStats(statsSlot, info, state, grid, rendered, latestDepth, cameraReader);
+      drawThumbnail(thumbCanvas, cameraReader);
     }
   });
+}
+
+function drawThumbnail(canvas: HTMLCanvasElement, reader: CameraColorReader | null): void {
+  const ctx = canvas.getContext('2d');
+  if (!ctx) return;
+  if (!reader || !reader.ready) {
+    ctx.clearRect(0, 0, canvas.width, canvas.height);
+    return;
+  }
+  const { width: w, height: h, buffer } = reader;
+  const img = ctx.createImageData(w, h);
+  // readPixels is bottom-up; flip vertically so the thumbnail reads like the camera.
+  for (let y = 0; y < h; y++) {
+    const srcRow = (h - 1 - y) * w;
+    const dstRow = y * w;
+    for (let x = 0; x < w; x++) {
+      const s = (srcRow + x) * 4;
+      const d = (dstRow + x) * 4;
+      img.data[d] = buffer[s];
+      img.data[d + 1] = buffer[s + 1];
+      img.data[d + 2] = buffer[s + 2];
+      img.data[d + 3] = 255;
+    }
+  }
+  ctx.putImageData(img, 0, 0);
 }
 
 function updateStats(
@@ -198,12 +292,28 @@ function updateStats(
   grid: VoxelGrid,
   rendered: number,
   depth: CpuDepthFrame | null,
+  reader: CameraColorReader | null,
 ): void {
+  const colorStatus =
+    state.colorMode === 'height'
+      ? '高さ'
+      : reader === null
+        ? 'カメラ(不可)'
+        : reader.failed
+          ? 'カメラ(失敗→高さ)'
+          : reader.ready
+            ? 'カメラ'
+            : 'カメラ(待機)';
+
   const rows: KV[] = [
     { label: '状態', value: state.accumulating ? '● 蓄積中' : '❚❚ 一時停止' },
     { label: 'ボクセル(2cm)', value: `${grid.size.toLocaleString()} セル` },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
-    { label: 'flipY(上下)', value: state.flipY ? 'ON' : 'OFF' },
+    { label: '色', value: colorStatus },
+    {
+      label: '色向き',
+      value: `X:${state.camFlipX ? '反転' : '正'} Y:${state.camFlipY ? '反転' : '正'}`,
+    },
     { label: 'depthUsage', value: info.depthUsage ?? '—' },
   ];
 
