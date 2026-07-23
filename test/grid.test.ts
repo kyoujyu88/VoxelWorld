@@ -255,3 +255,34 @@ describe('VoxelGrid.forEachDownsampled', () => {
     expect(n).toBe(2);
   });
 });
+
+describe('VoxelGrid proximity-weighted color', () => {
+  it('blends color by observation weight but counts raw hits', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    // Same cell: a red observation at weight 1, then a black one at weight 3 (nearer view).
+    g.addPoint(0.001, 0.001, 0.001, 255, 0, 0, 1);
+    g.addPoint(0.001, 0.001, 0.001, 0, 0, 0, 3);
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+    expect(g.readVoxel(key, out)).toBe(true);
+    // Weighted mean: (255*1 + 0*3) / (1+3) = 63.75. Occupancy count is raw hits (2), not weighted.
+    expect(out.r).toBeCloseTo(63.75, 6);
+    expect(out.count).toBe(2);
+  });
+
+  it('default weight 1 reproduces the plain mean', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
+    g.addPoint(0.001, 0.001, 0.001, 0, 0, 0);
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+    g.readVoxel(key, out);
+    expect(out.r).toBeCloseTo(150, 6);
+  });
+});

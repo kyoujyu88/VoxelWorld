@@ -25,12 +25,11 @@ const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (re
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
-const DOWNSAMPLE_MS = 400; // coarse-mode (factor > 1) mesh re-tessellation cadence while scanning
 const MAX_FACTOR = 8; // display voxel size up to 8× base = 16 cm
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
-const RENDER_CAP = 150_000;
-const GRID_CAP = 600_000;
+const RENDER_CAP = 250_000; // max instances drawn at once (2cm live path)
+const GRID_CAP = 2_000_000; // max internal 2cm cells — larger fields fit before hitting the cap
 
 // Height-based fallback color window (local-space Y), floor..ceiling.
 const HEIGHT_LO = -1.3;
@@ -159,6 +158,9 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
     pauseBtn.textContent = state.accumulating ? '⏸ 一時停止' : '▶ 再開';
+    // Coarse view doesn't refresh while scanning; toggling pause re-tessellates it with the
+    // latest data so you can inspect what you've captured.
+    if (state.displayFactor > 1) voxels.rebuildDownsampled(grid, state.displayFactor, MIN_OBS);
   });
   clearBtn.addEventListener('click', () => {
     grid.clear();
@@ -247,25 +249,34 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   let lastStats = 0;
   let lastPreview = 0;
   let lastCamera = 0;
-  let lastRebuild = 0;
   let latestDepth: CpuDepthFrame | null = null;
   let frameCount = 0;
   let fpsWindowStart = 0;
   let fps = 0;
+  // Camera world position for the current frame — used to weight observations by proximity so
+  // nearer, more accurate views refine a cell's color (accuracy improves as you approach).
+  let camX = 0;
+  let camY = 0;
+  let camZ = 0;
 
   const accumulate = (x: number, y: number, z: number, u: number, v: number): void => {
+    const dx = x - camX;
+    const dy = y - camY;
+    const dz = z - camZ;
+    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    const w = 1 / (dist > 0.3 ? dist : 0.3); // nearer = heavier (clamped so very close doesn't blow up)
     if (
       state.colorMode === 'camera' &&
       cameraReader !== null &&
       !cameraReader.failed &&
       cameraReader.sample(u, v, camRGB)
     ) {
-      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b);
+      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b, w);
       return;
     }
     const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
     heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
-    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255);
+    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255, w);
   };
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
@@ -301,6 +312,10 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     }
 
     if (latestDepth && state.accumulating) {
+      const camPos = view.transform.position; // camera world position (for proximity weighting)
+      camX = camPos.x;
+      camY = camPos.y;
+      camZ = camPos.z;
       reprojectDepthFrame(
         latestDepth,
         view.projectionMatrix,
@@ -310,13 +325,14 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       );
     }
 
-    // 3D voxel display. Base size (2cm) is incremental every frame; coarser display sizes
-    // re-tessellate on a throttle while scanning (and immediately on a slider change).
+    // 3D voxel display. Base size (2cm) is incremental every frame (cheap regardless of grid
+    // size). Coarser sizes re-tessellate only on a slider change / pause (see handlers), since a
+    // full aggregation sweep of a large grid is too heavy to run every frame — so here we just
+    // discard the renderer's dirty keys to keep that set bounded.
     if (state.displayFactor === 1) {
       voxels.applyUpdates(grid, MIN_OBS);
-    } else if (state.accumulating && time - lastRebuild >= DOWNSAMPLE_MS) {
-      lastRebuild = time;
-      voxels.rebuildDownsampled(grid, state.displayFactor, MIN_OBS);
+    } else {
+      grid.clearDirty();
     }
 
     // Overhead preview (bottom half, always base 2cm): incremental top-down redraw so the map
