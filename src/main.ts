@@ -144,7 +144,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   clearBtn.addEventListener('click', () => {
     grid.clear();
     voxels.reset();
-    overhead.clearCanvas();
+    overhead.reset();
   });
   colorBtn.addEventListener('click', () => {
     state.colorMode = state.colorMode === 'camera' ? 'height' : 'camera';
@@ -279,7 +279,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // visibly grows while the AR view scans on top.
     if (time - lastPreview >= PREVIEW_MS) {
       lastPreview = time;
-      overhead.render(grid, MIN_OBS);
+      overhead.update(grid, MIN_OBS);
     }
 
     if (time - lastStats >= STATS_MS) {
