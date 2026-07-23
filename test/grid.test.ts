@@ -135,3 +135,33 @@ describe('VoxelGrid dirty tracking + readVoxel', () => {
     expect(keys).toHaveLength(0);
   });
 });
+
+describe('VoxelGrid.forEachConfidentPoint', () => {
+  it('yields only confident cells with world-center + mean color as primitives', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    // Cell (0,0,0): two observations -> confident at minObs 2, mean color (150,0,0).
+    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
+    g.addPoint(0.01, 0.01, 0.01, 0, 0, 0);
+    // Cell (2,0,0): one observation -> below threshold.
+    g.addPoint(0.05, 0, 0, 9, 9, 9);
+
+    const seen: Array<[number, number, number, number, number, number]> = [];
+    g.forEachConfidentPoint(2, (cx, cy, cz, r, gg, b) => seen.push([cx, cy, cz, r, gg, b]));
+
+    expect(seen).toHaveLength(1);
+    const [cx, cy, cz, r, gg, b] = seen[0];
+    expect(cx).toBeCloseTo(0.01, 6); // cell (0,0,0) center
+    expect(cy).toBeCloseTo(0.01, 6);
+    expect(cz).toBeCloseTo(0.01, 6);
+    expect(r).toBeCloseTo(150, 6);
+    expect(gg).toBeCloseTo(0, 6);
+    expect(b).toBeCloseTo(0, 6);
+  });
+
+  it('yields nothing for an empty grid', () => {
+    const g = new VoxelGrid();
+    let n = 0;
+    g.forEachConfidentPoint(1, () => n++);
+    expect(n).toBe(0);
+  });
+});

@@ -8,6 +8,7 @@ import { computeDepthStats } from './render/depthHeatmap';
 import { CameraColorReader, type RGB } from './xr/cameraColor';
 import { VoxelGrid } from './voxel/grid';
 import { VoxelRenderer } from './render/voxelRenderer';
+import { OverheadPreview } from './render/overheadPreview';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { el, clear } from './ui/dom';
 
@@ -22,6 +23,7 @@ const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and s
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
 const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
+const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; full grid sweep each time)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
@@ -47,7 +49,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 3: ボクセル蓄積 — 深度を逆投影し 2cm グリッドに蓄積、カメラ実色で着色します。',
+        'Phase 5: 画面レイアウト — 上半分で AR スキャン、下半分に俯瞰ボクセルプレビュー。スキャンしながら結果が育つのを同時に見られます。',
     }),
   ]);
 
@@ -112,6 +114,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
   const overlay = el('div', { className: 'xr-overlay' });
   const hud = el('div', { className: 'hud' });
+  const overheadCanvas = el('canvas', { className: 'overhead' });
   const thumbCanvas = el('canvas', { className: 'cam-thumb', width: CAMERA_W, height: CAMERA_H });
   const statsSlot = el('div', { className: 'stats' });
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
@@ -120,13 +123,19 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const flipBtn = el('button', { className: 'ctl', textContent: '🔃 色向き' });
   const endBtn = el('button', { className: 'ghost', textContent: 'AR を終了' });
   hud.append(
-    el('div', { className: 'hud-title', textContent: 'Phase 3: ボクセル蓄積（カメラ実色）' }),
-    el('div', { className: 'hud-row' }, [statsSlot, thumbCanvas]),
+    el('div', {
+      className: 'hud-title',
+      textContent: 'Phase 5: 上=AR スキャン ／ 下=俯瞰プレビュー',
+    }),
+    el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
+    statsSlot,
     el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
   overlay.append(hud);
   document.body.append(overlay);
+
+  const overhead = new OverheadPreview(overheadCanvas);
 
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
@@ -135,6 +144,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   clearBtn.addEventListener('click', () => {
     grid.clear();
     voxels.reset();
+    overhead.clearCanvas();
   });
   colorBtn.addEventListener('click', () => {
     state.colorMode = state.colorMode === 'camera' ? 'height' : 'camera';
@@ -197,6 +207,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
   const info: SessionInfo = readSessionInfo(session);
   let lastStats = 0;
+  let lastPreview = 0;
   let lastCamera = 0;
   let rendered = 0;
   let latestDepth: CpuDepthFrame | null = null;
@@ -263,6 +274,13 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
     // Cheap incremental append every frame (only newly-confident voxels are uploaded).
     rendered = voxels.applyUpdates(grid, MIN_OBS);
+
+    // Overhead preview (bottom half): a full but throttled top-down redraw so the map
+    // visibly grows while the AR view scans on top.
+    if (time - lastPreview >= PREVIEW_MS) {
+      lastPreview = time;
+      overhead.render(grid, MIN_OBS);
+    }
 
     if (time - lastStats >= STATS_MS) {
       const dt = time - fpsWindowStart;

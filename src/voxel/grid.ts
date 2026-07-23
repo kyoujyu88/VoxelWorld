@@ -157,4 +157,34 @@ export class VoxelGrid {
       });
     }
   }
+
+  /**
+   * Allocation-free iteration over confident cells, passing world-center + mean color as
+   * primitives. Used by the overhead preview, which sweeps every voxel ~10x/second and must
+   * not allocate a view object (or an unpackKey object) per cell.
+   */
+  forEachConfidentPoint(
+    minObservations: number,
+    cb: (cx: number, cy: number, cz: number, r: number, g: number, b: number) => void,
+  ): void {
+    const s = this.voxelSize;
+    const half = s * 0.5;
+    for (const [key, rec] of this.cells) {
+      if (rec.count < minObservations) continue;
+      // Inline unpackKey to avoid allocating a { xi, yi, zi } object per cell.
+      const z = key % BASE;
+      const afterZ = (key - z) / BASE;
+      const y = afterZ % BASE;
+      const x = (afterZ - y) / BASE;
+      const inv = 1 / rec.count;
+      cb(
+        (x - OFFSET) * s + half,
+        (y - OFFSET) * s + half,
+        (z - OFFSET) * s + half,
+        rec.rSum * inv,
+        rec.gSum * inv,
+        rec.bSum * inv,
+      );
+    }
+  }
 }
