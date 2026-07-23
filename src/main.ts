@@ -47,7 +47,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 3: ボクセル蓄積 — 深度を逆投影し 2cm グリッドに蓄積、カメラ実色で着色します。',
+        'Phase 4: 描画最適化 — 深度を逆投影し 2cm グリッドへ蓄積、カメラ実色で着色。差分描画で高フレームレートを維持します。',
     }),
   ]);
 
@@ -120,7 +120,10 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const flipBtn = el('button', { className: 'ctl', textContent: '🔃 色向き' });
   const endBtn = el('button', { className: 'ghost', textContent: 'AR を終了' });
   hud.append(
-    el('div', { className: 'hud-title', textContent: 'Phase 3: ボクセル蓄積（カメラ実色）' }),
+    el('div', {
+      className: 'hud-title',
+      textContent: 'Phase 4: ボクセル蓄積（カメラ実色・最適化描画）',
+    }),
     el('div', { className: 'hud-row' }, [statsSlot, thumbCanvas]),
     el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
