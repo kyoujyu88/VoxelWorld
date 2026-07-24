@@ -8,12 +8,14 @@
  *  - rebuildDownsampled (Phase 6): a full re-tessellation at a coarser display size (factor×base),
  *    aggregating confident cells on the fly via grid.forEachDownsampled.
  *
- * Free-space carving (Phase 6.2) makes the base path removal-capable: `carve` projects drawn
- * voxels back into the depth image and swap-removes the ones floating in front of the real
- * surface. `instanceToKey` is the slot→key map that removal needs.
+ * A cell is drawn when it sits on the TSDF's zero crossing (|sdf| within the grid's surface band)
+ * and is well enough observed. Because fusion moves that crossing, drawn instances have to be
+ * re-validated as well as appended: `carve` walks them and swap-removes any that stopped being
+ * surface, plus fuses free-space evidence where the current view sees through one.
+ * `instanceToKey` is the slot→key map that removal needs.
  *
- * Incremental instances keep their first-confident color; the grid keeps the true running average,
- * which the downsampled rebuild (and export) use.
+ * Instances keep the color they were appended with; the grid keeps the weighted mean, which the
+ * downsampled rebuild (and export) use.
  */
 
 import { InstancedMesh, BoxGeometry, MeshBasicMaterial, Object3D, Color, Matrix4 } from 'three';
@@ -31,7 +33,16 @@ export class VoxelRenderer {
   private readonly color = new Color();
   private readonly keyToInstance = new Map<number, number>();
   private readonly instanceToKey: number[] = [];
-  private readonly scratch: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+  private readonly scratch: VoxelView = {
+    cx: 0,
+    cy: 0,
+    cz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+    weight: 0,
+    sdf: 0,
+  };
   private readonly swapMat = new Matrix4();
   private readonly swapColor = new Color();
   private count = 0;
@@ -53,16 +64,18 @@ export class VoxelRenderer {
   }
 
   /**
-   * Append base-size voxels that have newly reached `minObservations` (incremental, factor 1).
+   * Append base-size cells that have newly become surface (incremental, factor 1).
    * Only dirty cells are examined and only the appended buffer range is re-uploaded.
    */
-  applyUpdates(grid: VoxelGrid, minObservations: number): number {
+  applyUpdates(grid: VoxelGrid, minWeight: number): number {
     const start = this.count;
     const s = this.voxelSize * BASE_FILL;
     grid.drainDirty((key) => {
       if (this.count >= this.capacity) return;
       if (this.keyToInstance.has(key)) return;
-      if (!grid.readVoxel(key, this.scratch) || this.scratch.count < minObservations) return;
+      if (!grid.readVoxel(key, this.scratch)) return;
+      if (this.scratch.weight < minWeight) return;
+      if (Math.abs(this.scratch.sdf) > grid.surfaceBand) return; // not on the zero crossing
       const slot = this.count++;
       this.keyToInstance.set(key, slot);
       this.instanceToKey[slot] = key;
@@ -90,49 +103,67 @@ export class VoxelRenderer {
   }
 
   /**
-   * Free-space carve pass (base path only). Examines up to `budget` drawn instances starting from
-   * a rolling cursor, projects each voxel center into the current depth image via `ctx`, and for
-   * any that sit in free space records a miss in the grid and swap-removes the instance if its
-   * occupancy dropped below `minObservations`. Amortized so no single frame stalls. Returns the
-   * number carved.
+   * Validate + carve pass over the drawn instances (base path only). Walks up to `budget`
+   * instances from a rolling cursor and, for each:
+   *   1. drops it if the cell is no longer a surface cell — fusion moves the zero crossing, so an
+   *      instance drawn earlier can stop belonging on the surface;
+   *   2. otherwise, if the current depth image shows free space where it sits, fuses that
+   *      free-space evidence in (which pushes its distance out of the surface band and, once the
+   *      cell is fully empty, deletes it).
+   *
+   * Long-range floaters are cleared this way; the near-surface band is handled by fusion itself.
+   * Amortized so no single frame stalls. Returns the number of instances removed.
    */
   carve(
     grid: VoxelGrid,
     ctx: CarveContext,
-    minObservations: number,
+    minWeight: number,
     budget: number,
-    missStrength = 1,
+    freeWeight = 1,
   ): number {
-    if (this.count === 0 || !ctx.ready) return 0;
+    if (this.count === 0) return 0;
     const half = this.voxelSize * 0.5;
     let examined = 0;
-    let carved = 0;
+    let removed = 0;
     let i = this.carveCursor;
     while (examined < budget && this.count > 0) {
       if (i >= this.count) i = 0;
       const key = this.instanceToKey[i];
-      const { xi, yi, zi } = unpackKey(key);
       examined++;
-      if (
-        ctx.testFree(
-          xi * this.voxelSize + half,
-          yi * this.voxelSize + half,
-          zi * this.voxelSize + half,
-        )
-      ) {
-        // ctx.lastVoxelDepth ranks this view's quality against the cell's own best observation,
-        // so a distant, noisy view can't erase a surface that was scanned up close.
-        const stillDrawn = grid.recordMiss(key, minObservations, missStrength, ctx.lastVoxelDepth);
-        if (!stillDrawn) {
-          this.swapRemove(i);
-          carved++;
-          continue; // slot i now holds the moved instance (or i == count); re-examine it
+
+      // 1. Still a surface cell?
+      if (!grid.readVoxel(key, this.scratch)) {
+        this.swapRemove(i);
+        removed++;
+        continue;
+      }
+      if (this.scratch.weight < minWeight || Math.abs(this.scratch.sdf) > grid.surfaceBand) {
+        this.swapRemove(i);
+        removed++;
+        continue;
+      }
+
+      // 2. Does the current view see through it?
+      if (ctx.ready) {
+        const { xi, yi, zi } = unpackKey(key);
+        if (
+          ctx.testFree(
+            xi * this.voxelSize + half,
+            yi * this.voxelSize + half,
+            zi * this.voxelSize + half,
+          )
+        ) {
+          if (!grid.integrateFree(key, freeWeight, minWeight)) {
+            this.swapRemove(i);
+            removed++;
+            continue; // slot i now holds the moved instance (or i == count); re-examine it
+          }
         }
       }
       i++;
     }
     this.carveCursor = i;
-    return carved;
+    return removed;
   }
 
   /** Remove instance `slot` by moving the last instance into it (order-independent). */
@@ -164,12 +195,12 @@ export class VoxelRenderer {
    * The incremental keyToInstance map is not maintained here (factor > 1 disables the incremental
    * and carve paths). Returns the drawn coarse-voxel count.
    */
-  rebuildDownsampled(grid: VoxelGrid, factor: number, minObservations: number): number {
+  rebuildDownsampled(grid: VoxelGrid, factor: number, minWeight: number): number {
     this.keyToInstance.clear();
     this.count = 0;
     this.carveCursor = 0;
     const s = factor * this.voxelSize * COARSE_FILL;
-    grid.forEachDownsampled(factor, minObservations, (cx, cy, cz, r, g, b) => {
+    grid.forEachDownsampled(factor, minWeight, (cx, cy, cz, r, g, b) => {
       if (this.count >= this.capacity) return;
       const slot = this.count++;
       this.dummy.position.set(cx, cy, cz);

@@ -7,6 +7,7 @@ import { reprojectDepthFrame } from './xr/reproject';
 import { computeDepthStats } from './render/depthHeatmap';
 import { CameraColorReader, type RGB } from './xr/cameraColor';
 import { VoxelGrid } from './voxel/grid';
+import { fuseDepthSample } from './voxel/fuse';
 import { VoxelRenderer } from './render/voxelRenderer';
 import { OverheadPreview } from './render/overheadPreview';
 import { CarveContext } from './xr/carve';
@@ -21,13 +22,14 @@ if (!app) throw new Error('#app container not found');
 const VOXEL_SIZE = 0.02; // internal fine grid (2 cm)
 const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accurate 0.5–5 m
 const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and spurious voxels
-const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
-// Occupancy is bounded (see VoxelGrid.maxOccupancy), so these thresholds stay meaningful:
-// a cell's count is "how strongly is this supported right now", not "how long did I stare".
-const OCC_MAX = 10; // occupancy ceiling; carving can work a cell back down from here
-const MIN_OBS_DEFAULT = 3; // occupancy needed to draw a cell
-const MIN_OBS_MAX = 8; // slider max (must stay below OCC_MAX or nothing would ever draw)
-const CARVE_MISS = 2; // occupancy removed per free-space hit (OCC_MAX/CARVE_MISS sweeps to clear)
+const STRIDE = 3; // subsample the depth buffer; each sample now fuses a whole band, not one cell
+// TSDF fusion parameters. Weight is ~1/depth² (voxblox: depth error grows steeply with range)
+// and the per-cell total is capped, so a well-scanned surface is barely moved by a distant look.
+const MAX_WEIGHT = 20; // per-cell weight ceiling — keeps the map able to heal
+const MIN_W_DEFAULT = 3; // accumulated weight a cell needs before it is drawn
+const MIN_W_MAX = 12; // slider max
+const FREE_WEIGHT = 2; // weight of one "I see through here" observation from the carve pass
+const TRUNCATION = 0.04; // ±4cm band around a hit that each measurement updates (2 voxels)
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
@@ -52,7 +54,7 @@ interface ScanState {
   camFlipX: boolean;
   camFlipY: boolean;
   displayFactor: number; // display/export voxel size = displayFactor × base (2cm); 1 = live 2cm
-  minObs: number; // occupancy (out of OCC_MAX) a cell needs to be drawn/kept
+  minWeight: number; // accumulated weight a cell needs to be drawn/kept
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -61,7 +63,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 6: 上で AR スキャン、下に俯瞰プレビュー。占有値に上限を設けたので、浮いたボクセルは近づくと数秒で消えます（カービング）。「ノイズ除去」スライダーで残す強さを調整できます。',
+        'Phase 7: TSDF フュージョン — 面までの符号付き距離を加重平均する方式（KinectFusion 系）に刷新。面が 1 層に収束し、手前の空間は自然に消えます。',
     }),
   ]);
 
@@ -114,7 +116,8 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const grid = new VoxelGrid({
     voxelSize: VOXEL_SIZE,
     maxVoxels: GRID_CAP,
-    maxOccupancy: OCC_MAX,
+    truncation: TRUNCATION,
+    maxWeight: MAX_WEIGHT,
   });
   const voxels = new VoxelRenderer(RENDER_CAP, VOXEL_SIZE);
   scene.add(voxels.mesh);
@@ -125,7 +128,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     camFlipX: false,
     camFlipY: true,
     displayFactor: 1,
-    minObs: MIN_OBS_DEFAULT,
+    minWeight: MIN_W_DEFAULT,
   };
   const heightColor = new THREE.Color();
   const camRGB: RGB = { r: 0, g: 0, b: 0 };
@@ -152,14 +155,14 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const stabSlider = el('input', {
     type: 'range',
     min: '1',
-    max: String(MIN_OBS_MAX),
+    max: String(MIN_W_MAX),
     step: '1',
-    value: String(MIN_OBS_DEFAULT),
+    value: String(MIN_W_DEFAULT),
     className: 'size-slider',
   });
   const stabLabel = el('span', {
     className: 'size-label',
-    textContent: `${MIN_OBS_DEFAULT} / ${OCC_MAX}`,
+    textContent: `${MIN_W_DEFAULT} / ${MAX_WEIGHT}`,
   });
   const stabRow = el('div', { className: 'size-row' }, [
     el('span', { className: 'size-cap', textContent: 'ノイズ除去' }),
@@ -174,7 +177,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 6: スキャン品質（占有上限＋カービング＋ノイズ除去）',
+      textContent: 'Phase 7: TSDF フュージョン（符号付き距離の加重平均）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
@@ -194,7 +197,8 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     pauseBtn.textContent = state.accumulating ? '⏸ 一時停止' : '▶ 再開';
     // Coarse view doesn't refresh while scanning; toggling pause re-tessellates it with the
     // latest data so you can inspect what you've captured.
-    if (state.displayFactor > 1) voxels.rebuildDownsampled(grid, state.displayFactor, state.minObs);
+    if (state.displayFactor > 1)
+      voxels.rebuildDownsampled(grid, state.displayFactor, state.minWeight);
   });
   clearBtn.addEventListener('click', () => {
     grid.clear();
@@ -233,21 +237,20 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       voxels.reset();
       grid.markAllDirty(); // the next applyUpdates() re-seeds every cell at base 2cm
     } else {
-      voxels.rebuildDownsampled(grid, f, state.minObs);
+      voxels.rebuildDownsampled(grid, f, state.minWeight);
     }
   });
 
-  // Noise-removal threshold: the occupancy (out of OCC_MAX) a cell needs to stay drawn. Because
-  // occupancy is bounded and carving subtracts from it, this reads as "how strongly must this cell
-  // be supported right now" — higher drops voxels that carving has partly eaten. Dragging updates
-  // the label; releasing re-tessellates the already-scanned cells — no re-scan.
+  // Noise-removal threshold: the accumulated weight (out of MAX_WEIGHT) a cell needs to stay
+  // drawn — i.e. how well established it must be. Dragging updates the label; releasing
+  // re-tessellates the already-scanned cells at the new threshold — no re-scan.
   stabSlider.addEventListener('input', () => {
-    stabLabel.textContent = `${stabSlider.value} / ${OCC_MAX}`;
+    stabLabel.textContent = `${stabSlider.value} / ${MAX_WEIGHT}`;
   });
   stabSlider.addEventListener('change', () => {
-    const n = Math.min(MIN_OBS_MAX, Math.max(1, parseInt(stabSlider.value, 10) || MIN_OBS_DEFAULT));
-    state.minObs = n;
-    stabLabel.textContent = `${n} / ${OCC_MAX}`;
+    const n = Math.min(MIN_W_MAX, Math.max(1, parseInt(stabSlider.value, 10) || MIN_W_DEFAULT));
+    state.minWeight = n;
+    stabLabel.textContent = `${n} / ${MAX_WEIGHT}`;
     if (state.displayFactor === 1) {
       voxels.reset();
       grid.markAllDirty();
@@ -307,9 +310,14 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   let fpsWindowStart = 0;
   let fps = 0;
 
-  // `depth` is the measured distance to this point: it both weights the color (nearer = sharper)
-  // and ranks the observation's quality, so a later distant glimpse can't degrade a cell that was
-  // already scanned up close (see VoxelGrid.qualityRatio).
+  // Camera world position for the current frame — the fusion band is walked along the view ray.
+  let camX = 0;
+  let camY = 0;
+  let camZ = 0;
+
+  // Fuse one measurement: not a single occupied cell, but the band of signed distances along its
+  // ray. Weight is ~1/depth² because depth error grows steeply with range (voxblox), so near looks
+  // dominate the average and a later distant glimpse barely moves a well-scanned surface.
   const accumulate = (
     x: number,
     y: number,
@@ -318,19 +326,28 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     v: number,
     depth: number,
   ): void => {
-    const w = 1 / (depth > 0.3 ? depth : 0.3); // nearer = heavier (clamped near the minimum range)
+    const d = depth > 0.3 ? depth : 0.3; // clamp at the minimum useful range
+    const w = 1 / (d * d);
+    let r: number;
+    let g: number;
+    let b: number;
     if (
       state.colorMode === 'camera' &&
       cameraReader !== null &&
       !cameraReader.failed &&
       cameraReader.sample(u, v, camRGB)
     ) {
-      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b, w, depth);
-      return;
+      r = camRGB.r;
+      g = camRGB.g;
+      b = camRGB.b;
+    } else {
+      const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
+      heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
+      r = heightColor.r * 255;
+      g = heightColor.g * 255;
+      b = heightColor.b * 255;
     }
-    const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
-    heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
-    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255, w, depth);
+    fuseDepthSample(grid, camX, camY, camZ, x, y, z, depth, w, r, g, b);
   };
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
@@ -366,6 +383,10 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     }
 
     if (latestDepth && state.accumulating) {
+      const camPos = view.transform.position; // ray origin for the fusion band
+      camX = camPos.x;
+      camY = camPos.y;
+      camZ = camPos.z;
       reprojectDepthFrame(
         latestDepth,
         view.projectionMatrix,
@@ -380,7 +401,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // full aggregation sweep of a large grid is too heavy to run every frame — so here we just
     // discard the renderer's dirty keys to keep that set bounded.
     if (state.displayFactor === 1) {
-      voxels.applyUpdates(grid, state.minObs);
+      voxels.applyUpdates(grid, state.minWeight);
       // Free-space carving: remove voxels floating in front of the measured surface, so getting
       // closer clears noise. Amortized (a slice of instances per frame). Base size only.
       if (latestDepth && state.accumulating) {
@@ -389,7 +410,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
           margin: CARVE_MARGIN,
           minDepth: CARVE_MIN_DEPTH,
         });
-        voxels.carve(grid, carveCtx, state.minObs, CARVE_BUDGET, CARVE_MISS);
+        voxels.carve(grid, carveCtx, state.minWeight, CARVE_BUDGET, FREE_WEIGHT);
       }
     } else {
       grid.clearDirty();
@@ -399,7 +420,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // visibly grows while the AR view scans on top.
     if (time - lastPreview >= PREVIEW_MS) {
       lastPreview = time;
-      overhead.update(grid, state.minObs);
+      overhead.update(grid, state.minWeight);
     }
 
     if (time - lastStats >= STATS_MS) {
@@ -463,12 +484,12 @@ function updateStats(
   const rows: KV[] = [
     { label: 'FPS', value: fps > 0 ? fps.toFixed(0) : '—' },
     { label: '状態', value: state.accumulating ? '● 蓄積中' : '❚❚ 一時停止' },
-    { label: 'ボクセル(2cm)', value: `${grid.size.toLocaleString()} セル` },
+    { label: 'TSDF セル', value: `${grid.size.toLocaleString()}` },
     {
       label: '表示サイズ',
       value: `${state.displayFactor * 2}cm${state.displayFactor > 1 ? ` (×${state.displayFactor})` : ''}`,
     },
-    { label: 'ノイズ除去', value: `${state.minObs} / ${OCC_MAX}` },
+    { label: 'ノイズ除去', value: `${state.minWeight} / ${MAX_WEIGHT}` },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
     { label: '色', value: colorStatus },
     {
@@ -488,12 +509,6 @@ function updateStats(
         value: s.medianMeters === null ? '—' : `${s.medianMeters.toFixed(2)}m`,
       },
     );
-  }
-  if (grid.rejectedLowQuality > 0) {
-    rows.push({
-      label: '低品質を拒否',
-      value: `${grid.rejectedLowQuality.toLocaleString()} 件`,
-    });
   }
   if (grid.droppedAtCap > 0) {
     rows.push({ label: '⚠ グリッド上限', value: `${grid.droppedAtCap.toLocaleString()} 破棄` });
