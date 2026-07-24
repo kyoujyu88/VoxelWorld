@@ -48,6 +48,14 @@ export interface VoxelGridOptions {
   voxelSize?: number;
   /** Hard cap on the number of distinct occupied cells (memory guard). */
   maxVoxels?: number;
+  /**
+   * Upper bound on a cell's occupancy count (default 10). Without a bound, staring at a surface
+   * pushes `count` into the hundreds (~3600 depth points per frame), which makes both the
+   * minObservations threshold and free-space carving meaningless: every cell — noise included —
+   * blows past any threshold instantly, and carving's small per-sweep decrement can never work it
+   * back down. Bounding occupancy keeps "how strongly is this cell supported right now?" live.
+   */
+  maxOccupancy?: number;
 }
 
 export interface VoxelView {
@@ -64,6 +72,7 @@ export interface VoxelView {
 export class VoxelGrid {
   readonly voxelSize: number;
   readonly maxVoxels: number;
+  readonly maxOccupancy: number;
   private readonly cells = new Map<number, VoxelRecord>();
   /** Keys touched since the last drainDirty() — lets the renderer update incrementally. */
   private readonly dirty = new Set<number>();
@@ -83,6 +92,7 @@ export class VoxelGrid {
   constructor(options: VoxelGridOptions = {}) {
     this.voxelSize = options.voxelSize ?? 0.02;
     this.maxVoxels = options.maxVoxels ?? 500_000;
+    this.maxOccupancy = options.maxOccupancy ?? 10;
   }
 
   get size(): number {
@@ -113,7 +123,8 @@ export class VoxelGrid {
       rec = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0 };
       this.cells.set(key, rec);
     }
-    rec.count++;
+    // Occupancy saturates; color sums keep accumulating so the mean keeps refining.
+    if (rec.count < this.maxOccupancy) rec.count++;
     rec.wSum += w;
     rec.rSum += r * w;
     rec.gSum += g * w;
