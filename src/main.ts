@@ -22,13 +22,17 @@ const VOXEL_SIZE = 0.02; // internal fine grid (2 cm)
 const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accurate 0.5–5 m
 const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and spurious voxels
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
-const MIN_OBS_DEFAULT = 6; // net observations before a cell draws; higher = cleaner but sparser
-const MIN_OBS_MAX = 14; // slider range for scan stability
+// Occupancy is bounded (see VoxelGrid.maxOccupancy), so these thresholds stay meaningful:
+// a cell's count is "how strongly is this supported right now", not "how long did I stare".
+const OCC_MAX = 10; // occupancy ceiling; carving can work a cell back down from here
+const MIN_OBS_DEFAULT = 3; // occupancy needed to draw a cell
+const MIN_OBS_MAX = 8; // slider max (must stay below OCC_MAX or nothing would ever draw)
+const CARVE_MISS = 2; // occupancy removed per free-space hit (OCC_MAX/CARVE_MISS sweeps to clear)
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
 const MAX_FACTOR = 8; // display voxel size up to 8× base = 16 cm
-const CARVE_BUDGET = 8000; // voxels tested for free-space carving per frame (amortized full sweep)
+const CARVE_BUDGET = 16000; // voxels tested for free-space carving per frame (amortized full sweep)
 const CARVE_MARGIN = 0.08; // surface must be ≥8cm beyond a voxel before it's carved (noise guard)
 const CARVE_MIN_DEPTH = 0.2; // ignore voxels nearer than this to the camera when carving
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
@@ -48,7 +52,7 @@ interface ScanState {
   camFlipX: boolean;
   camFlipY: boolean;
   displayFactor: number; // display/export voxel size = displayFactor × base (2cm); 1 = live 2cm
-  minObs: number; // net observations before a cell is drawn/kept (scan-stability threshold)
+  minObs: number; // occupancy (out of OCC_MAX) a cell needs to be drawn/kept
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -57,7 +61,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 6: 上で AR スキャン、下に俯瞰プレビュー。表示サイズと「スキャン安定性」をスライダーで調整でき、浮いたボクセルは近づくと消えます（カービング）。',
+        'Phase 6: 上で AR スキャン、下に俯瞰プレビュー。占有値に上限を設けたので、浮いたボクセルは近づくと数秒で消えます（カービング）。「ノイズ除去」スライダーで残す強さを調整できます。',
     }),
   ]);
 
@@ -107,7 +111,11 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const scene = new THREE.Scene();
   const camera = new THREE.PerspectiveCamera();
 
-  const grid = new VoxelGrid({ voxelSize: VOXEL_SIZE, maxVoxels: GRID_CAP });
+  const grid = new VoxelGrid({
+    voxelSize: VOXEL_SIZE,
+    maxVoxels: GRID_CAP,
+    maxOccupancy: OCC_MAX,
+  });
   const voxels = new VoxelRenderer(RENDER_CAP, VOXEL_SIZE);
   scene.add(voxels.mesh);
 
@@ -143,15 +151,18 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   ]);
   const stabSlider = el('input', {
     type: 'range',
-    min: '3',
+    min: '1',
     max: String(MIN_OBS_MAX),
     step: '1',
     value: String(MIN_OBS_DEFAULT),
     className: 'size-slider',
   });
-  const stabLabel = el('span', { className: 'size-label', textContent: String(MIN_OBS_DEFAULT) });
+  const stabLabel = el('span', {
+    className: 'size-label',
+    textContent: `${MIN_OBS_DEFAULT} / ${OCC_MAX}`,
+  });
   const stabRow = el('div', { className: 'size-row' }, [
-    el('span', { className: 'size-cap', textContent: 'スキャン安定性' }),
+    el('span', { className: 'size-cap', textContent: 'ノイズ除去' }),
     stabSlider,
     stabLabel,
   ]);
@@ -163,7 +174,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 6: スキャン品質（安定性スライダー＋カービング）',
+      textContent: 'Phase 6: スキャン品質（占有上限＋カービング＋ノイズ除去）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
@@ -226,16 +237,17 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     }
   });
 
-  // Scan-stability threshold (minObs). Higher rejects more noise (thinner, cleaner surfaces) but
-  // needs more looks. Dragging updates the label; releasing re-tessellates the already-scanned
-  // cells at the new threshold — no re-scan.
+  // Noise-removal threshold: the occupancy (out of OCC_MAX) a cell needs to stay drawn. Because
+  // occupancy is bounded and carving subtracts from it, this reads as "how strongly must this cell
+  // be supported right now" — higher drops voxels that carving has partly eaten. Dragging updates
+  // the label; releasing re-tessellates the already-scanned cells — no re-scan.
   stabSlider.addEventListener('input', () => {
-    stabLabel.textContent = stabSlider.value;
+    stabLabel.textContent = `${stabSlider.value} / ${OCC_MAX}`;
   });
   stabSlider.addEventListener('change', () => {
-    const n = Math.min(MIN_OBS_MAX, Math.max(3, parseInt(stabSlider.value, 10) || MIN_OBS_DEFAULT));
+    const n = Math.min(MIN_OBS_MAX, Math.max(1, parseInt(stabSlider.value, 10) || MIN_OBS_DEFAULT));
     state.minObs = n;
-    stabLabel.textContent = String(n);
+    stabLabel.textContent = `${n} / ${OCC_MAX}`;
     if (state.displayFactor === 1) {
       voxels.reset();
       grid.markAllDirty();
@@ -380,7 +392,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
           margin: CARVE_MARGIN,
           minDepth: CARVE_MIN_DEPTH,
         });
-        voxels.carve(grid, carveCtx, state.minObs, CARVE_BUDGET);
+        voxels.carve(grid, carveCtx, state.minObs, CARVE_BUDGET, CARVE_MISS);
       }
     } else {
       grid.clearDirty();
@@ -459,7 +471,7 @@ function updateStats(
       label: '表示サイズ',
       value: `${state.displayFactor * 2}cm${state.displayFactor > 1 ? ` (×${state.displayFactor})` : ''}`,
     },
-    { label: '安定性(minObs)', value: `${state.minObs}` },
+    { label: 'ノイズ除去', value: `${state.minObs} / ${OCC_MAX}` },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
     { label: '色', value: colorStatus },
     {

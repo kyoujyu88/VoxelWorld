@@ -287,6 +287,41 @@ describe('VoxelGrid proximity-weighted color', () => {
   });
 });
 
+describe('VoxelGrid occupancy ceiling', () => {
+  it('saturates count at maxOccupancy so carving can work it back down', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxOccupancy: 10 });
+    // Staring at a surface: far more hits than the ceiling.
+    for (let i = 0; i < 500; i++) g.addPoint(0, 0, 0, 1, 1, 1);
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+    g.readVoxel(key, out);
+    expect(out.count).toBe(10);
+
+    // Bounded occupancy means a fixed, small number of carve sweeps clears it.
+    for (let i = 0; i < 5; i++) g.recordMiss(key, 3, 2);
+    expect(g.size).toBe(0);
+  });
+
+  it('keeps refining the mean color after occupancy saturates', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxOccupancy: 2 });
+    g.addPoint(0, 0, 0, 255, 255, 255);
+    g.addPoint(0, 0, 0, 255, 255, 255);
+    g.addPoint(0, 0, 0, 0, 0, 0); // past the ceiling: no count, but colour still averages
+    g.addPoint(0, 0, 0, 0, 0, 0);
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+    g.readVoxel(key, out);
+    expect(out.count).toBe(2);
+    expect(out.r).toBeCloseTo(127.5, 6); // mean of 4 observations, not just the first 2
+  });
+});
+
 describe('VoxelGrid.recordMiss (free-space carving)', () => {
   const keyOf = (g: VoxelGrid): number => {
     let key = -1;

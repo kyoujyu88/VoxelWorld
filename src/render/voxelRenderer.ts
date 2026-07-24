@@ -96,7 +96,13 @@ export class VoxelRenderer {
    * occupancy dropped below `minObservations`. Amortized so no single frame stalls. Returns the
    * number carved.
    */
-  carve(grid: VoxelGrid, ctx: CarveContext, minObservations: number, budget: number): number {
+  carve(
+    grid: VoxelGrid,
+    ctx: CarveContext,
+    minObservations: number,
+    budget: number,
+    missStrength = 1,
+  ): number {
     if (this.count === 0 || !ctx.ready) return 0;
     const half = this.voxelSize * 0.5;
     let examined = 0;
@@ -114,7 +120,7 @@ export class VoxelRenderer {
           zi * this.voxelSize + half,
         )
       ) {
-        const stillDrawn = grid.recordMiss(key, minObservations);
+        const stillDrawn = grid.recordMiss(key, minObservations, missStrength);
         if (!stillDrawn) {
           this.swapRemove(i);
           carved++;
