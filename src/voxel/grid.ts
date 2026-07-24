@@ -41,6 +41,8 @@ export interface VoxelRecord {
   rSum: number; // sum of color × weight
   gSum: number;
   bSum: number;
+  /** Closest distance (m) this cell has ever been measured from — its data quality. */
+  bestDist: number;
 }
 
 export interface VoxelGridOptions {
@@ -56,6 +58,16 @@ export interface VoxelGridOptions {
    * back down. Bounding occupancy keeps "how strongly is this cell supported right now?" live.
    */
   maxOccupancy?: number;
+  /**
+   * How much worse than a cell's best observation a new one may be before it is ignored
+   * (default 1.5 = "more than 1.5x farther away"). Depth error grows steeply with distance, so
+   * without this a later, far-away glimpse would re-pollute a surface that was carefully scanned
+   * up close — washing out its color, adding a noise shell, and even carving away correct voxels.
+   * The rule is deliberately asymmetric: a better (closer) look may refine, correct, or carve
+   * anything, but a clearly worse look may not touch data that is already better. Map quality
+   * therefore only improves.
+   */
+  qualityRatio?: number;
 }
 
 export interface VoxelView {
@@ -73,6 +85,7 @@ export class VoxelGrid {
   readonly voxelSize: number;
   readonly maxVoxels: number;
   readonly maxOccupancy: number;
+  readonly qualityRatio: number;
   private readonly cells = new Map<number, VoxelRecord>();
   /** Keys touched since the last drainDirty() — lets the renderer update incrementally. */
   private readonly dirty = new Set<number>();
@@ -88,11 +101,14 @@ export class VoxelGrid {
   private maxZi = 0;
   /** Incremented whenever a cell is skipped because the cap was reached (for reporting). */
   droppedAtCap = 0;
+  /** Observations ignored for being far worse than the cell's existing data (for reporting). */
+  rejectedLowQuality = 0;
 
   constructor(options: VoxelGridOptions = {}) {
     this.voxelSize = options.voxelSize ?? 0.02;
     this.maxVoxels = options.maxVoxels ?? 500_000;
     this.maxOccupancy = options.maxOccupancy ?? 10;
+    this.qualityRatio = options.qualityRatio ?? 1.5;
   }
 
   get size(): number {
@@ -102,10 +118,21 @@ export class VoxelGrid {
   /**
    * Quantize and accumulate a colored world point. Colors are 0..255. `weight` (default 1) lets
    * the caller value nearer, more accurate observations more heavily — the stored color is the
-   * weight-weighted mean, so revisiting a cell from close up pulls its color toward the accurate
-   * one. The occupancy count is the raw hit count and ignores the weight.
+   * weight-weighted mean. `obsDist` is how far away this measurement was taken (meters); a cell
+   * remembers the closest distance it has ever been seen from, and an observation more than
+   * `qualityRatio`x farther than that is **ignored entirely**, so a distant glimpse can never
+   * degrade a surface that was already scanned up close.
    */
-  addPoint(x: number, y: number, z: number, r: number, g: number, b: number, weight = 1): void {
+  addPoint(
+    x: number,
+    y: number,
+    z: number,
+    r: number,
+    g: number,
+    b: number,
+    weight = 1,
+    obsDist = Infinity,
+  ): void {
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
     const w = weight > 0 ? weight : 1;
     const xi = Math.floor(x / this.voxelSize);
@@ -120,8 +147,13 @@ export class VoxelGrid {
         this.droppedAtCap++;
         return;
       }
-      rec = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0 };
+      rec = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0, bestDist: obsDist };
       this.cells.set(key, rec);
+    } else if (obsDist > rec.bestDist * this.qualityRatio) {
+      this.rejectedLowQuality++;
+      return; // a clearly worse look may not touch better data
+    } else if (obsDist < rec.bestDist) {
+      rec.bestDist = obsDist; // quality only improves
     }
     // Occupancy saturates; color sums keep accumulating so the mean keeps refining.
     if (rec.count < this.maxOccupancy) rec.count++;
@@ -152,6 +184,7 @@ export class VoxelGrid {
     this.dirtyPreview.clear();
     this.hasCells = false;
     this.droppedAtCap = 0;
+    this.rejectedLowQuality = 0;
   }
 
   /** Visit every key changed since the last call, then clear the dirty set (no allocation). */
@@ -170,10 +203,18 @@ export class VoxelGrid {
    * `strength`, deleting the cell entirely once occupancy reaches zero. Returns whether the cell is
    * still occupied enough to draw (`count >= minObservations`) so the renderer can drop its
    * instance when it isn't. Colour sums are left untouched — a re-hit cell keeps its mean.
+   *
+   * `obsDist` is how far the carving view is from the cell. Same asymmetry as addPoint: a distant,
+   * noisy view must not erase a surface that was scanned up close (its depth error easily reads
+   * "beyond" a real wall), while a closer view may carve away anything.
    */
-  recordMiss(key: number, minObservations: number, strength = 1): boolean {
+  recordMiss(key: number, minObservations: number, strength = 1, obsDist = Infinity): boolean {
     const rec = this.cells.get(key);
     if (rec === undefined) return false;
+    if (obsDist > rec.bestDist * this.qualityRatio) {
+      this.rejectedLowQuality++;
+      return rec.count >= minObservations; // too coarse a look to be trusted against this cell
+    }
     rec.count -= strength;
     if (rec.count <= 0) {
       this.cells.delete(key);
@@ -325,8 +366,10 @@ export class VoxelGrid {
       if (ckey === null) continue;
       let c = coarse.get(ckey);
       if (c === undefined) {
-        c = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0 };
+        c = { count: 0, wSum: 0, rSum: 0, gSum: 0, bSum: 0, bestDist: rec.bestDist };
         coarse.set(ckey, c);
+      } else if (rec.bestDist < c.bestDist) {
+        c.bestDist = rec.bestDist; // coarse cell inherits its best-measured constituent
       }
       c.count += rec.count;
       c.wSum += rec.wSum;

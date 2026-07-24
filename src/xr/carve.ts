@@ -47,6 +47,11 @@ export class CarveContext {
   private minDepth = 0.2;
   private depth: CpuDepthFrame | null = null;
   ready = false;
+  /**
+   * Distance (m) from the camera to the voxel most recently passed to `testFree`. Valid right
+   * after a `testFree` call; callers use it to rank this view's quality against the cell's own.
+   */
+  lastVoxelDepth = 0;
 
   update(
     projectionMatrix: ArrayLike<number>,
@@ -78,6 +83,7 @@ export class CarveContext {
 
     const eye = this.eye.set(wx, wy, wz, 1).applyMatrix4(this.invView); // eye space (w stays 1)
     const voxelDepth = -eye.z; // perpendicular distance (camera looks down -Z)
+    this.lastVoxelDepth = voxelDepth;
     if (voxelDepth <= this.minDepth) return false;
 
     eye.applyMatrix4(this.proj); // now clip space

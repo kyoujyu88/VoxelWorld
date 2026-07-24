@@ -306,30 +306,31 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   let frameCount = 0;
   let fpsWindowStart = 0;
   let fps = 0;
-  // Camera world position for the current frame — used to weight observations by proximity so
-  // nearer, more accurate views refine a cell's color (accuracy improves as you approach).
-  let camX = 0;
-  let camY = 0;
-  let camZ = 0;
 
-  const accumulate = (x: number, y: number, z: number, u: number, v: number): void => {
-    const dx = x - camX;
-    const dy = y - camY;
-    const dz = z - camZ;
-    const dist = Math.sqrt(dx * dx + dy * dy + dz * dz);
-    const w = 1 / (dist > 0.3 ? dist : 0.3); // nearer = heavier (clamped so very close doesn't blow up)
+  // `depth` is the measured distance to this point: it both weights the color (nearer = sharper)
+  // and ranks the observation's quality, so a later distant glimpse can't degrade a cell that was
+  // already scanned up close (see VoxelGrid.qualityRatio).
+  const accumulate = (
+    x: number,
+    y: number,
+    z: number,
+    u: number,
+    v: number,
+    depth: number,
+  ): void => {
+    const w = 1 / (depth > 0.3 ? depth : 0.3); // nearer = heavier (clamped near the minimum range)
     if (
       state.colorMode === 'camera' &&
       cameraReader !== null &&
       !cameraReader.failed &&
       cameraReader.sample(u, v, camRGB)
     ) {
-      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b, w);
+      grid.addPoint(x, y, z, camRGB.r, camRGB.g, camRGB.b, w, depth);
       return;
     }
     const t = Math.min(1, Math.max(0, (y - HEIGHT_LO) / (HEIGHT_HI - HEIGHT_LO)));
     heightColor.setHSL((1 - t) * 0.7, 0.85, 0.55);
-    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255, w);
+    grid.addPoint(x, y, z, heightColor.r * 255, heightColor.g * 255, heightColor.b * 255, w, depth);
   };
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
@@ -365,10 +366,6 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     }
 
     if (latestDepth && state.accumulating) {
-      const camPos = view.transform.position; // camera world position (for proximity weighting)
-      camX = camPos.x;
-      camY = camPos.y;
-      camZ = camPos.z;
       reprojectDepthFrame(
         latestDepth,
         view.projectionMatrix,
@@ -491,6 +488,12 @@ function updateStats(
         value: s.medianMeters === null ? '—' : `${s.medianMeters.toFixed(2)}m`,
       },
     );
+  }
+  if (grid.rejectedLowQuality > 0) {
+    rows.push({
+      label: '低品質を拒否',
+      value: `${grid.rejectedLowQuality.toLocaleString()} 件`,
+    });
   }
   if (grid.droppedAtCap > 0) {
     rows.push({ label: '⚠ グリッド上限', value: `${grid.droppedAtCap.toLocaleString()} 破棄` });
