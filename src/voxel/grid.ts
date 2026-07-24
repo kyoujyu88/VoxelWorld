@@ -36,7 +36,7 @@ export function unpackKey(key: number): { xi: number; yi: number; zi: number } {
 }
 
 export interface VoxelRecord {
-  count: number; // raw observation count (drives the minObservations occupancy threshold)
+  count: number; // net occupancy: +1 per hit, -1 per carve; drawn once it reaches minObservations
   wSum: number; // sum of observation weights; color is weighted (nearer views count more)
   rSum: number; // sum of color × weight
   gSum: number;
@@ -152,6 +152,23 @@ export class VoxelGrid {
   /** Discard the renderer's pending dirty keys without visiting them (used in coarse mode). */
   clearDirty(): void {
     this.dirty.clear();
+  }
+
+  /**
+   * Record that a carve ray passed through this cell (free-space evidence): drop its occupancy by
+   * `strength`, deleting the cell entirely once occupancy reaches zero. Returns whether the cell is
+   * still occupied enough to draw (`count >= minObservations`) so the renderer can drop its
+   * instance when it isn't. Colour sums are left untouched — a re-hit cell keeps its mean.
+   */
+  recordMiss(key: number, minObservations: number, strength = 1): boolean {
+    const rec = this.cells.get(key);
+    if (rec === undefined) return false;
+    rec.count -= strength;
+    if (rec.count <= 0) {
+      this.cells.delete(key);
+      return false;
+    }
+    return rec.count >= minObservations;
   }
 
   /** Like drainDirty, but for the preview's independent dirty set (a second consumer). */

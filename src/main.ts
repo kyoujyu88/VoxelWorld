@@ -9,6 +9,7 @@ import { CameraColorReader, type RGB } from './xr/cameraColor';
 import { VoxelGrid } from './voxel/grid';
 import { VoxelRenderer } from './render/voxelRenderer';
 import { OverheadPreview } from './render/overheadPreview';
+import { CarveContext } from './xr/carve';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { el, clear } from './ui/dom';
 
@@ -26,6 +27,9 @@ const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
 const MAX_FACTOR = 8; // display voxel size up to 8× base = 16 cm
+const CARVE_BUDGET = 8000; // voxels tested for free-space carving per frame (amortized full sweep)
+const CARVE_MARGIN = 0.08; // surface must be ≥8cm beyond a voxel before it's carved (noise guard)
+const CARVE_MIN_DEPTH = 0.2; // ignore voxels nearer than this to the camera when carving
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
 const RENDER_CAP = 250_000; // max instances drawn at once (2cm live path)
@@ -154,6 +158,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   document.body.append(overlay);
 
   const overhead = new OverheadPreview(overheadCanvas);
+  const carveCtx = new CarveContext();
 
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
@@ -331,6 +336,16 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // discard the renderer's dirty keys to keep that set bounded.
     if (state.displayFactor === 1) {
       voxels.applyUpdates(grid, MIN_OBS);
+      // Free-space carving: remove voxels floating in front of the measured surface, so getting
+      // closer clears noise. Amortized (a slice of instances per frame). Base size only.
+      if (latestDepth && state.accumulating) {
+        carveCtx.update(view.projectionMatrix, view.transform.matrix, latestDepth, {
+          flipY: true,
+          margin: CARVE_MARGIN,
+          minDepth: CARVE_MIN_DEPTH,
+        });
+        voxels.carve(grid, carveCtx, MIN_OBS, CARVE_BUDGET);
+      }
     } else {
       grid.clearDirty();
     }
