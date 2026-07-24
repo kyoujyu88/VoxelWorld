@@ -26,11 +26,20 @@ export interface ReprojectOptions {
 }
 
 /**
- * Called for each reprojected point: world x/y/z plus the source texel's normalized view
- * coordinates (u, v). Because the camera image is aligned to the XRView, (u, v) double as the
- * camera-image UV for per-voxel color sampling.
+ * Called for each reprojected point: world x/y/z, the source texel's normalized view coordinates
+ * (u, v), and the measured depth in meters. Because the camera image is aligned to the XRView,
+ * (u, v) double as the camera-image UV for per-voxel color sampling. `depth` is how far away the
+ * measurement was taken — near measurements are far more accurate, so callers use it to weight
+ * color and to rank observation quality.
  */
-export type PointSink = (x: number, y: number, z: number, u: number, v: number) => void;
+export type PointSink = (
+  x: number,
+  y: number,
+  z: number,
+  u: number,
+  v: number,
+  depth: number,
+) => void;
 
 const _ndbToView = new Matrix4();
 const _invProj = new Matrix4();
@@ -84,7 +93,7 @@ export function reprojectDepthFrame(
       // scale so eye-space Z == -d (camera looks down -Z), then eye -> world
       const t = -d / dirZ;
       _world.set(_eye.x * ew * t, _eye.y * ew * t, dirZ * t).applyMatrix4(_viewToWorld);
-      sink(_world.x, _world.y, _world.z, nvx, nvy);
+      sink(_world.x, _world.y, _world.z, nvx, nvy, d);
       emitted++;
     }
   }

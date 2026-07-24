@@ -322,6 +322,68 @@ describe('VoxelGrid occupancy ceiling', () => {
   });
 });
 
+describe('VoxelGrid observation-quality lock', () => {
+  const view = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 });
+  const soleKey = (g: VoxelGrid): number => {
+    let key = -1;
+    g.drainDirty((k) => {
+      key = k;
+    });
+    return key;
+  };
+
+  it('ignores an observation far worse than the cell’s best, keeping the close scan intact', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
+    g.addPoint(0, 0, 0, 255, 0, 0, 1, 0.5); // scanned up close: red, bestDist 0.5m
+    const key = soleKey(g);
+    const before = view();
+    g.readVoxel(key, before);
+
+    // Later glimpsed from 3m (> 0.5 * 1.5): must not touch color or occupancy.
+    g.addPoint(0, 0, 0, 0, 0, 255, 1, 3);
+    const after = view();
+    g.readVoxel(key, after);
+    expect(after.r).toBeCloseTo(before.r, 6);
+    expect(after.count).toBe(before.count);
+    expect(g.rejectedLowQuality).toBe(1);
+  });
+
+  it('accepts a closer observation and improves the recorded quality', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
+    g.addPoint(0, 0, 0, 255, 0, 0, 1, 3); // first seen from afar
+    const key = soleKey(g);
+    g.addPoint(0, 0, 0, 0, 0, 0, 1, 0.5); // then up close: allowed, and now the best
+    const out = view();
+    g.readVoxel(key, out);
+    expect(out.count).toBe(2);
+
+    // Quality is now 0.5m, so the 3m view is locked out from here on.
+    g.addPoint(0, 0, 0, 255, 255, 255, 1, 3);
+    g.readVoxel(key, out);
+    expect(out.count).toBe(2);
+  });
+
+  it('will not let a distant view carve away a closely-scanned cell', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
+    for (let i = 0; i < 5; i++) g.addPoint(0, 0, 0, 1, 1, 1, 1, 0.5);
+    const key = soleKey(g);
+    // A 3m view claims free space: refused, cell survives.
+    expect(g.recordMiss(key, 3, 2, 3)).toBe(true);
+    expect(g.size).toBe(1);
+    // A 0.5m view is trusted and carves it away.
+    for (let i = 0; i < 3; i++) g.recordMiss(key, 3, 2, 0.5);
+    expect(g.size).toBe(0);
+  });
+
+  it('lets a close view carve away a cell that only a distant view created', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
+    for (let i = 0; i < 4; i++) g.addPoint(0, 0, 0, 1, 1, 1, 1, 3); // far-created noise
+    const key = soleKey(g);
+    for (let i = 0; i < 2; i++) g.recordMiss(key, 3, 2, 0.5); // approaching cleans it up
+    expect(g.size).toBe(0);
+  });
+});
+
 describe('VoxelGrid.recordMiss (free-space carving)', () => {
   const keyOf = (g: VoxelGrid): number => {
     let key = -1;

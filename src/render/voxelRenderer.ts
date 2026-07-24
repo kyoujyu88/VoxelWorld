@@ -120,7 +120,9 @@ export class VoxelRenderer {
           zi * this.voxelSize + half,
         )
       ) {
-        const stillDrawn = grid.recordMiss(key, minObservations, missStrength);
+        // ctx.lastVoxelDepth ranks this view's quality against the cell's own best observation,
+        // so a distant, noisy view can't erase a surface that was scanned up close.
+        const stillDrawn = grid.recordMiss(key, minObservations, missStrength, ctx.lastVoxelDepth);
         if (!stillDrawn) {
           this.swapRemove(i);
           carved++;
