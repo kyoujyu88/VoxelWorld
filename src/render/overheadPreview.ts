@@ -99,7 +99,16 @@ export class OverheadPreview {
   readonly height = PREVIEW_H;
   private fit: FitTransform | null = null;
   private readonly pending: number[] = [];
-  private readonly scratch: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
+  private readonly scratch: VoxelView = {
+    cx: 0,
+    cy: 0,
+    cz: 0,
+    r: 0,
+    g: 0,
+    b: 0,
+    weight: 0,
+    sdf: 0,
+  };
 
   constructor(canvas: HTMLCanvasElement) {
     canvas.width = PREVIEW_W;
@@ -111,10 +120,10 @@ export class OverheadPreview {
   }
 
   /**
-   * Fold the grid's newly-confident voxels into the map. Common case: paint only the drained
+   * Fold the grid's newly-surfaced cells into the map. Common case: paint only the drained
    * dirty cells (O(new)). Rebuild (full sweep) only on first data or when growth escapes the fit.
    */
-  update(grid: VoxelGrid, minObservations: number): void {
+  update(grid: VoxelGrid, minWeight: number): void {
     if (!this.ctx || !this.img) return;
     if (grid.size === 0) {
       if (this.fit !== null) this.reset();
@@ -126,31 +135,35 @@ export class OverheadPreview {
     grid.drainDirtyPreview((k) => this.pending.push(k));
 
     if (this.fit === null) {
-      this.rebuild(grid, minObservations);
+      this.rebuild(grid, minWeight);
       return;
     }
 
-    // If any newly-confident voxel now falls outside the current fit, refit + full rebuild.
+    // If any new surface cell now falls outside the current fit, refit + full rebuild.
     for (const key of this.pending) {
-      if (!grid.readVoxel(key, this.scratch) || this.scratch.count < minObservations) continue;
+      if (!grid.readVoxel(key, this.scratch)) continue;
+      if (this.scratch.weight < minWeight) continue;
+      if (Math.abs(this.scratch.sdf) > grid.surfaceBand) continue;
       const p = worldToPixel(this.fit, this.scratch.cx, this.scratch.cz);
       if (p.px < 0 || p.px >= this.width || p.py < 0 || p.py >= this.height) {
-        this.rebuild(grid, minObservations);
+        this.rebuild(grid, minWeight);
         return;
       }
     }
 
     // Otherwise paint just the new voxels into the persistent buffer.
     for (const key of this.pending) {
-      if (!grid.readVoxel(key, this.scratch) || this.scratch.count < minObservations) continue;
+      if (!grid.readVoxel(key, this.scratch)) continue;
+      if (this.scratch.weight < minWeight) continue;
+      if (Math.abs(this.scratch.sdf) > grid.surfaceBand) continue;
       const s = this.scratch;
       this.paint(s.cx, s.cy, s.cz, s.r, s.g, s.b);
     }
     this.blit();
   }
 
-  /** Full redraw: refit to the (padded) grid bounds and repaint every confident cell. */
-  private rebuild(grid: VoxelGrid, minObservations: number): void {
+  /** Full redraw: refit to the (padded) grid bounds and repaint every surface cell. */
+  private rebuild(grid: VoxelGrid, minWeight: number): void {
     const b = grid.getBounds();
     if (!b) {
       this.reset();
@@ -165,9 +178,7 @@ export class OverheadPreview {
       PAD,
     );
     this.clearBuffers();
-    grid.forEachConfidentPoint(minObservations, (cx, cy, cz, r, g, bl) =>
-      this.paint(cx, cy, cz, r, g, bl),
-    );
+    grid.forEachSurfacePoint(minWeight, (cx, cy, cz, r, g, bl) => this.paint(cx, cy, cz, r, g, bl));
     this.blit();
   }
 

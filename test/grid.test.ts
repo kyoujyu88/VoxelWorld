@@ -1,6 +1,15 @@
 import { describe, it, expect } from 'vitest';
 import { VoxelGrid, packKey, unpackKey, type VoxelView } from '../src/voxel/grid';
 
+const view = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, weight: 0, sdf: 0 });
+
+/** Drain the renderer dirty set and return the single key that was touched. */
+const soleKey = (g: VoxelGrid): number => {
+  const keys: number[] = [];
+  g.drainDirty((k) => keys.push(k));
+  return keys[0];
+};
+
 describe('packKey / unpackKey', () => {
   it('round-trips positive, negative, and zero coordinates', () => {
     const cases: Array<[number, number, number]> = [
@@ -26,78 +35,128 @@ describe('packKey / unpackKey', () => {
   });
 });
 
-describe('VoxelGrid', () => {
-  it('quantizes points into one 2cm cell and averages color', () => {
+describe('VoxelGrid.integrate', () => {
+  it('quantizes to a cell and records the signed distance and weight', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
-    g.addPoint(0.01, 0.019, 0.005, 0, 300, 0);
-    g.addPoint(0.019, 0.0, 0.019, 0, 0, 300);
+    g.integrate(0.001, 0.001, 0.001, 0, 1, 10, 20, 30, 1);
     expect(g.size).toBe(1);
 
-    const views: VoxelView[] = [];
-    g.forEach(1, (v) => views.push(v));
-    expect(views).toHaveLength(1);
-    expect(views[0].count).toBe(3);
-    expect(views[0].r).toBeCloseTo(100, 6);
-    expect(views[0].g).toBeCloseTo(100, 6);
-    expect(views[0].b).toBeCloseTo(100, 6);
-    expect(views[0].cx).toBeCloseTo(0.01, 6); // cell (0,0,0) center
-    expect(views[0].cy).toBeCloseTo(0.01, 6);
-    expect(views[0].cz).toBeCloseTo(0.01, 6);
+    const out = view();
+    expect(g.readVoxel(soleKey(g), out)).toBe(true);
+    expect(out.cx).toBeCloseTo(0.01, 6); // cell (0,0,0) center
+    expect(out.cy).toBeCloseTo(0.01, 6);
+    expect(out.cz).toBeCloseTo(0.01, 6);
+    expect(out.sdf).toBeCloseTo(0, 6);
+    expect(out.weight).toBeCloseTo(1, 6);
+    expect(out.r).toBeCloseTo(10, 6);
   });
 
-  it('separates points that fall in different cells', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.0, 0, 0, 1, 1, 1);
-    g.addPoint(0.05, 0, 0, 1, 1, 1); // x cell 2
-    expect(g.size).toBe(2);
+  it('truncates the signed distance to ±truncation', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.05 });
+    g.integrate(0, 0, 0, 10, 1); // absurdly far in front
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.sdf).toBeCloseTo(0.05, 6);
   });
 
-  it('filters by minObservations', () => {
+  it('converges the surface between measurements that straddle it (sub-voxel averaging)', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    // Same cell measured as 1cm in front and 1cm behind the surface: the truth is halfway.
+    g.integrate(0, 0, 0, 0.01, 1);
+    g.integrate(0, 0, 0, -0.01, 1);
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.sdf).toBeCloseTo(0, 6);
+    expect(out.weight).toBeCloseTo(2, 6);
+  });
+
+  it('weights measurements, so a confident one dominates a weak one', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    g.integrate(0, 0, 0, 0.04, 1); // weak, far-off reading
+    g.integrate(0, 0, 0, 0.0, 9); // confident close reading
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.sdf).toBeCloseTo(0.004, 6); // (0.04*1 + 0*9) / 10
+  });
+
+  it('caps accumulated weight so the map can still heal', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxWeight: 5 });
+    for (let i = 0; i < 100; i++) g.integrate(0, 0, 0, 0, 1);
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.weight).toBe(5);
+  });
+
+  it('ignores non-finite input and non-positive weight', () => {
     const g = new VoxelGrid();
-    g.addPoint(0, 0, 0, 10, 10, 10); // count 1
-    g.addPoint(1, 1, 1, 20, 20, 20);
-    g.addPoint(1, 1, 1, 20, 20, 20); // count 2
-    expect(g.countConfident(2)).toBe(1);
-    const seen: VoxelView[] = [];
-    g.forEach(2, (v) => seen.push(v));
-    expect(seen).toHaveLength(1);
-  });
-
-  it('respects maxVoxels but still accumulates into existing cells', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 2 });
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.addPoint(1, 0, 0, 1, 1, 1);
-    g.addPoint(2, 0, 0, 1, 1, 1); // 3rd distinct cell -> dropped
-    expect(g.size).toBe(2);
-    expect(g.droppedAtCap).toBe(1);
-    g.addPoint(0.001, 0, 0, 1, 1, 1); // existing cell (0,0,0)
-    expect(g.size).toBe(2);
-  });
-
-  it('ignores non-finite points', () => {
-    const g = new VoxelGrid();
-    g.addPoint(NaN, 0, 0, 1, 1, 1);
-    g.addPoint(0, Infinity, 0, 1, 1, 1);
-    expect(g.size).toBe(0);
-  });
-
-  it('clears all cells', () => {
-    const g = new VoxelGrid();
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.clear();
+    g.integrate(NaN, 0, 0, 0, 1);
+    g.integrate(0, Infinity, 0, 0, 1);
+    g.integrate(0, 0, 0, NaN, 1);
+    g.integrate(0, 0, 0, 0, 0);
     expect(g.size).toBe(0);
   });
 });
 
-describe('VoxelGrid dirty tracking + readVoxel', () => {
-  const emptyView = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 });
+describe('VoxelGrid surface extraction', () => {
+  it('counts only cells near the zero crossing that are well enough observed', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0, 5); // on the surface, well observed
+    g.integrate(0.1, 0, 0, 0.05, 5); // clearly in free space
+    g.integrate(0.2, 0, 0, 0, 1); // on the surface but barely observed
+    expect(g.size).toBe(3);
+    expect(g.countSurface(3)).toBe(1);
+    let n = 0;
+    g.forEachSurfacePoint(3, () => n++);
+    expect(n).toBe(1);
+  });
 
+  it('drops a cell out of the surface as free-space evidence accumulates', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0, 4);
+    const key = soleKey(g);
+    expect(g.countSurface(3)).toBe(1);
+
+    // Seeing through the cell repeatedly pushes its distance toward +truncation.
+    expect(g.integrateFree(key, 4, 3)).toBe(false); // (0*4 + 0.06*4)/8 = 0.03 > band
+    expect(g.countSurface(3)).toBe(0);
+    expect(g.size).toBe(1); // still remembered as "empty here"
+  });
+
+  it('deletes a cell entirely once it is fully empty', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    g.integrate(0, 0, 0, 0, 1);
+    const key = soleKey(g);
+    for (let i = 0; i < 50; i++) g.integrateFree(key, 5, 3);
+    expect(g.size).toBe(0);
+  });
+});
+
+describe('VoxelGrid color fusion', () => {
+  it('keeps a weighted running mean and caps the color weight', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxWeight: 100 });
+    g.integrate(0, 0, 0, 0, 1, 255, 0, 0, 1);
+    g.integrate(0, 0, 0, 0, 3, 0, 0, 0, 3); // 3x more confident, black
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.r).toBeCloseTo(63.75, 6); // (255*1 + 0*3) / 4
+  });
+
+  it('leaves color untouched when colorWeight is 0 (samples away from the surface)', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.integrate(0, 0, 0, 0, 1, 200, 200, 200, 1);
+    g.integrate(0, 0, 0, 0.03, 1, 0, 0, 0, 0); // geometry only
+    const out = view();
+    g.readVoxel(soleKey(g), out);
+    expect(out.r).toBeCloseTo(200, 6);
+  });
+});
+
+describe('VoxelGrid dirty tracking', () => {
   it('drainDirty yields each touched cell once, then clears', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.addPoint(0.001, 0, 0, 1, 1, 1); // same cell
-    g.addPoint(0.05, 0, 0, 1, 1, 1); // different cell
+    g.integrate(0, 0, 0, 0, 1);
+    g.integrate(0.001, 0, 0, 0, 1); // same cell
+    g.integrate(0.05, 0, 0, 0, 1); // different cell
     const first: number[] = [];
     g.drainDirty((k) => first.push(k));
     expect(first).toHaveLength(2);
@@ -106,311 +165,108 @@ describe('VoxelGrid dirty tracking + readVoxel', () => {
     expect(second).toHaveLength(0);
   });
 
-  it('readVoxel fills world-center + mean color + count', () => {
+  it('drainDirtyPreview is independent of drainDirty', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
-    g.addPoint(0.01, 0.01, 0.01, 0, 0, 0); // same cell (0,0,0)
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    const out = emptyView();
-    expect(g.readVoxel(key, out)).toBe(true);
-    expect(out.count).toBe(2);
-    expect(out.r).toBeCloseTo(150, 6);
-    expect(out.cx).toBeCloseTo(0.01, 6);
-  });
-
-  it('readVoxel returns false for an absent key', () => {
-    const g = new VoxelGrid();
-    expect(g.readVoxel(123456, emptyView())).toBe(false);
-  });
-
-  it('clear() empties the dirty set', () => {
-    const g = new VoxelGrid();
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.clear();
-    const keys: number[] = [];
-    g.drainDirty((k) => keys.push(k));
-    expect(keys).toHaveLength(0);
-  });
-});
-
-describe('VoxelGrid.forEachConfidentPoint', () => {
-  it('yields only confident cells with world-center + mean color as primitives', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    // Cell (0,0,0): two observations -> confident at minObs 2, mean color (150,0,0).
-    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
-    g.addPoint(0.01, 0.01, 0.01, 0, 0, 0);
-    // Cell (2,0,0): one observation -> below threshold.
-    g.addPoint(0.05, 0, 0, 9, 9, 9);
-
-    const seen: Array<[number, number, number, number, number, number]> = [];
-    g.forEachConfidentPoint(2, (cx, cy, cz, r, gg, b) => seen.push([cx, cy, cz, r, gg, b]));
-
-    expect(seen).toHaveLength(1);
-    const [cx, cy, cz, r, gg, b] = seen[0];
-    expect(cx).toBeCloseTo(0.01, 6); // cell (0,0,0) center
-    expect(cy).toBeCloseTo(0.01, 6);
-    expect(cz).toBeCloseTo(0.01, 6);
-    expect(r).toBeCloseTo(150, 6);
-    expect(gg).toBeCloseTo(0, 6);
-    expect(b).toBeCloseTo(0, 6);
-  });
-
-  it('yields nothing for an empty grid', () => {
-    const g = new VoxelGrid();
-    let n = 0;
-    g.forEachConfidentPoint(1, () => n++);
-    expect(n).toBe(0);
-  });
-});
-
-describe('VoxelGrid bounds + preview dirty set', () => {
-  it('getBounds is null when empty and resets on clear()', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    expect(g.getBounds()).toBeNull();
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    expect(g.getBounds()).not.toBeNull();
-    g.clear();
-    expect(g.getBounds()).toBeNull();
-  });
-
-  it('getBounds spans the world-center AABB of stored cells', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.001, 0.001, 0.001, 1, 1, 1); // cell (0,0,0) -> center 0.01
-    g.addPoint(0.05, 0.09, 0.05, 1, 1, 1); // cell (2,4,2) -> center (0.05,0.09,0.05)
-    const b = g.getBounds();
-    expect(b).not.toBeNull();
-    expect((b as NonNullable<typeof b>).minX).toBeCloseTo(0.01, 6);
-    expect((b as NonNullable<typeof b>).maxX).toBeCloseTo(0.05, 6);
-    expect((b as NonNullable<typeof b>).minY).toBeCloseTo(0.01, 6);
-    expect((b as NonNullable<typeof b>).maxY).toBeCloseTo(0.09, 6);
-    expect((b as NonNullable<typeof b>).minZ).toBeCloseTo(0.01, 6);
-    expect((b as NonNullable<typeof b>).maxZ).toBeCloseTo(0.05, 6);
-  });
-
-  it('drainDirtyPreview is independent of drainDirty and clears after draining', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.addPoint(0.05, 0, 0, 1, 1, 1);
-    // Draining the renderer's dirty set must not empty the preview's set.
+    g.integrate(0, 0, 0, 0, 1);
+    g.integrate(0.05, 0, 0, 0, 1);
     g.drainDirty(() => {});
     const previewKeys: number[] = [];
     g.drainDirtyPreview((k) => previewKeys.push(k));
     expect(previewKeys).toHaveLength(2);
-    // Second drain is empty.
-    const again: number[] = [];
-    g.drainDirtyPreview((k) => again.push(k));
-    expect(again).toHaveLength(0);
+  });
+
+  it('markAllDirty re-offers every stored cell', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.integrate(0, 0, 0, 0, 1);
+    g.integrate(0.05, 0, 0, 0, 1);
+    g.drainDirty(() => {});
+    g.markAllDirty();
+    const keys: number[] = [];
+    g.drainDirty((k) => keys.push(k));
+    expect(keys).toHaveLength(2);
+  });
+
+  it('clear() empties cells and both dirty sets', () => {
+    const g = new VoxelGrid();
+    g.integrate(0, 0, 0, 0, 1);
+    g.clear();
+    expect(g.size).toBe(0);
+    const keys: number[] = [];
+    g.drainDirty((k) => keys.push(k));
+    g.drainDirtyPreview((k) => keys.push(k));
+    expect(keys).toHaveLength(0);
+  });
+});
+
+describe('VoxelGrid capacity + bounds', () => {
+  it('respects maxVoxels but still fuses into existing cells', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 2 });
+    g.integrate(0, 0, 0, 0, 1);
+    g.integrate(1, 0, 0, 0, 1);
+    g.integrate(2, 0, 0, 0, 1); // 3rd distinct cell -> dropped
+    expect(g.size).toBe(2);
+    expect(g.droppedAtCap).toBe(1);
+    g.integrate(0.001, 0, 0, 0, 1); // existing cell still updates
+    expect(g.size).toBe(2);
+  });
+
+  it('getBounds is null when empty and spans the stored cell centers', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    expect(g.getBounds()).toBeNull();
+    g.integrate(0.001, 0.001, 0.001, 0, 1); // cell (0,0,0) -> center 0.01
+    g.integrate(0.05, 0.09, 0.05, 0, 1); // cell (2,4,2) -> center (0.05,0.09,0.05)
+    const b = g.getBounds();
+    expect(b).not.toBeNull();
+    const bb = b as NonNullable<typeof b>;
+    expect(bb.minX).toBeCloseTo(0.01, 6);
+    expect(bb.maxX).toBeCloseTo(0.05, 6);
+    expect(bb.maxY).toBeCloseTo(0.09, 6);
+    g.clear();
+    expect(g.getBounds()).toBeNull();
   });
 });
 
 describe('VoxelGrid.forEachDownsampled', () => {
-  it('factor 1 reproduces the confident cells', () => {
+  it('factor 1 reproduces the surface cells', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0, 0, 0, 10, 20, 30);
-    g.addPoint(0, 0, 0, 10, 20, 30);
-    g.addPoint(0.05, 0, 0, 40, 50, 60);
-    g.addPoint(0.05, 0, 0, 40, 50, 60);
-    const confident: number[] = [];
-    g.forEachConfidentPoint(2, (cx) => confident.push(cx));
+    g.integrate(0, 0, 0, 0, 5, 10, 20, 30, 5);
+    g.integrate(0.05, 0, 0, 0, 5, 10, 20, 30, 5);
     const down: number[] = [];
-    g.forEachDownsampled(1, 2, (cx) => down.push(cx));
-    expect(down.length).toBe(confident.length);
-    expect(down.length).toBe(2);
+    g.forEachDownsampled(1, 3, (cx) => down.push(cx));
+    expect(down).toHaveLength(2);
   });
 
-  it('factor 2 merges a 2×2×2 block and means the color over all observations', () => {
+  it('factor 2 merges a 2x2x2 block and weight-means the color', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    // Internal cell (0,0,0): two obs of red (200,0,0).
-    g.addPoint(0.001, 0.001, 0.001, 200, 0, 0);
-    g.addPoint(0.001, 0.001, 0.001, 200, 0, 0);
-    // Internal cell (1,0,0): two obs of black — same coarse cell at factor 2.
-    g.addPoint(0.03, 0.001, 0.001, 0, 0, 0);
-    g.addPoint(0.03, 0.001, 0.001, 0, 0, 0);
+    // Internal cells (0,0,0) and (1,0,0) share coarse cell (0,0,0) at factor 2.
+    g.integrate(0.001, 0.001, 0.001, 0, 3, 200, 0, 0, 3);
+    g.integrate(0.03, 0.001, 0.001, 0, 1, 0, 0, 0, 1);
 
-    const out: Array<[number, number, number, number, number, number]> = [];
-    g.forEachDownsampled(2, 2, (cx, cy, cz, r, gg, b) => out.push([cx, cy, cz, r, gg, b]));
+    const out: Array<[number, number, number, number]> = [];
+    g.forEachDownsampled(2, 1, (cx, cy, cz, r) => out.push([cx, cy, cz, r]));
     expect(out).toHaveLength(1);
-    const [cx, cy, cz, r, gg, b] = out[0];
-    // Coarse cell (0,0,0), size 0.04 -> center 0.02.
-    expect(cx).toBeCloseTo(0.02, 6);
+    const [cx, cy, cz, r] = out[0];
+    expect(cx).toBeCloseTo(0.02, 6); // coarse cell (0,0,0), size 0.04 -> center 0.02
     expect(cy).toBeCloseTo(0.02, 6);
     expect(cz).toBeCloseTo(0.02, 6);
-    // rSum = 200*2 + 0*2 = 400 over count 4 -> 100.
-    expect(r).toBeCloseTo(100, 6);
-    expect(gg).toBeCloseTo(0, 6);
-    expect(b).toBeCloseTo(0, 6);
+    expect(r).toBeCloseTo(150, 6); // (200*3 + 0*1) / 4
   });
 
   it('factor 2 keeps cells in different coarse blocks separate', () => {
     const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.001, 0, 0, 1, 1, 1);
-    g.addPoint(0.001, 0, 0, 1, 1, 1); // internal (0,0,0) -> coarse (0,0,0)
-    g.addPoint(0.05, 0, 0, 1, 1, 1);
-    g.addPoint(0.05, 0, 0, 1, 1, 1); // internal (2,0,0) -> coarse (1,0,0)
+    g.integrate(0.001, 0, 0, 0, 3); // internal (0,0,0) -> coarse (0,0,0)
+    g.integrate(0.05, 0, 0, 0, 3); // internal (2,0,0) -> coarse (1,0,0)
     let n = 0;
-    g.forEachDownsampled(2, 2, () => n++);
+    g.forEachDownsampled(2, 1, () => n++);
     expect(n).toBe(2);
   });
-});
 
-describe('VoxelGrid proximity-weighted color', () => {
-  it('blends color by observation weight but counts raw hits', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    // Same cell: a red observation at weight 1, then a black one at weight 3 (nearer view).
-    g.addPoint(0.001, 0.001, 0.001, 255, 0, 0, 1);
-    g.addPoint(0.001, 0.001, 0.001, 0, 0, 0, 3);
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
-    expect(g.readVoxel(key, out)).toBe(true);
-    // Weighted mean: (255*1 + 0*3) / (1+3) = 63.75. Occupancy count is raw hits (2), not weighted.
-    expect(out.r).toBeCloseTo(63.75, 6);
-    expect(out.count).toBe(2);
-  });
-
-  it('default weight 1 reproduces the plain mean', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0.001, 0.001, 0.001, 300, 0, 0);
-    g.addPoint(0.001, 0.001, 0.001, 0, 0, 0);
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
-    g.readVoxel(key, out);
-    expect(out.r).toBeCloseTo(150, 6);
-  });
-});
-
-describe('VoxelGrid occupancy ceiling', () => {
-  it('saturates count at maxOccupancy so carving can work it back down', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, maxOccupancy: 10 });
-    // Staring at a surface: far more hits than the ceiling.
-    for (let i = 0; i < 500; i++) g.addPoint(0, 0, 0, 1, 1, 1);
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
-    g.readVoxel(key, out);
-    expect(out.count).toBe(10);
-
-    // Bounded occupancy means a fixed, small number of carve sweeps clears it.
-    for (let i = 0; i < 5; i++) g.recordMiss(key, 3, 2);
-    expect(g.size).toBe(0);
-  });
-
-  it('keeps refining the mean color after occupancy saturates', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, maxOccupancy: 2 });
-    g.addPoint(0, 0, 0, 255, 255, 255);
-    g.addPoint(0, 0, 0, 255, 255, 255);
-    g.addPoint(0, 0, 0, 0, 0, 0); // past the ceiling: no count, but colour still averages
-    g.addPoint(0, 0, 0, 0, 0, 0);
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    const out: VoxelView = { cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 };
-    g.readVoxel(key, out);
-    expect(out.count).toBe(2);
-    expect(out.r).toBeCloseTo(127.5, 6); // mean of 4 observations, not just the first 2
-  });
-});
-
-describe('VoxelGrid observation-quality lock', () => {
-  const view = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, count: 0 });
-  const soleKey = (g: VoxelGrid): number => {
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    return key;
-  };
-
-  it('ignores an observation far worse than the cell’s best, keeping the close scan intact', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
-    g.addPoint(0, 0, 0, 255, 0, 0, 1, 0.5); // scanned up close: red, bestDist 0.5m
-    const key = soleKey(g);
-    const before = view();
-    g.readVoxel(key, before);
-
-    // Later glimpsed from 3m (> 0.5 * 1.5): must not touch color or occupancy.
-    g.addPoint(0, 0, 0, 0, 0, 255, 1, 3);
-    const after = view();
-    g.readVoxel(key, after);
-    expect(after.r).toBeCloseTo(before.r, 6);
-    expect(after.count).toBe(before.count);
-    expect(g.rejectedLowQuality).toBe(1);
-  });
-
-  it('accepts a closer observation and improves the recorded quality', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
-    g.addPoint(0, 0, 0, 255, 0, 0, 1, 3); // first seen from afar
-    const key = soleKey(g);
-    g.addPoint(0, 0, 0, 0, 0, 0, 1, 0.5); // then up close: allowed, and now the best
-    const out = view();
-    g.readVoxel(key, out);
-    expect(out.count).toBe(2);
-
-    // Quality is now 0.5m, so the 3m view is locked out from here on.
-    g.addPoint(0, 0, 0, 255, 255, 255, 1, 3);
-    g.readVoxel(key, out);
-    expect(out.count).toBe(2);
-  });
-
-  it('will not let a distant view carve away a closely-scanned cell', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
-    for (let i = 0; i < 5; i++) g.addPoint(0, 0, 0, 1, 1, 1, 1, 0.5);
-    const key = soleKey(g);
-    // A 3m view claims free space: refused, cell survives.
-    expect(g.recordMiss(key, 3, 2, 3)).toBe(true);
-    expect(g.size).toBe(1);
-    // A 0.5m view is trusted and carves it away.
-    for (let i = 0; i < 3; i++) g.recordMiss(key, 3, 2, 0.5);
-    expect(g.size).toBe(0);
-  });
-
-  it('lets a close view carve away a cell that only a distant view created', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, qualityRatio: 1.5 });
-    for (let i = 0; i < 4; i++) g.addPoint(0, 0, 0, 1, 1, 1, 1, 3); // far-created noise
-    const key = soleKey(g);
-    for (let i = 0; i < 2; i++) g.recordMiss(key, 3, 2, 0.5); // approaching cleans it up
-    expect(g.size).toBe(0);
-  });
-});
-
-describe('VoxelGrid.recordMiss (free-space carving)', () => {
-  const keyOf = (g: VoxelGrid): number => {
-    let key = -1;
-    g.drainDirty((k) => {
-      key = k;
-    });
-    return key;
-  };
-
-  it('lowers occupancy and reports when it falls below the threshold', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    for (let i = 0; i < 5; i++) g.addPoint(0, 0, 0, 1, 1, 1); // count 5
-    const key = keyOf(g);
-    expect(g.recordMiss(key, 3)).toBe(true); // 5 -> 4
-    expect(g.recordMiss(key, 3)).toBe(true); // 4 -> 3
-    expect(g.recordMiss(key, 3)).toBe(false); // 3 -> 2, below minObs
-    expect(g.size).toBe(1); // cell still present
-  });
-
-  it('deletes the cell once occupancy reaches zero', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02 });
-    g.addPoint(0, 0, 0, 1, 1, 1);
-    g.addPoint(0, 0, 0, 1, 1, 1); // count 2
-    const key = keyOf(g);
-    expect(g.recordMiss(key, 3)).toBe(false); // 2 -> 1
-    expect(g.recordMiss(key, 3)).toBe(false); // 1 -> 0 -> deleted
-    expect(g.size).toBe(0);
-    expect(g.recordMiss(key, 3)).toBe(false); // already gone, no throw
+  it('excludes cells that are not on the surface', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0, 3); // surface
+    g.integrate(0.03, 0, 0, 0.05, 3); // free space, same coarse cell at factor 4
+    let n = 0;
+    g.forEachDownsampled(4, 1, () => n++);
+    expect(n).toBe(1);
   });
 });
