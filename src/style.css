@@ -266,6 +266,7 @@ table.kv td {
 
 .size-cap {
   flex: 0 0 auto;
+  min-width: 6.5em;
   white-space: nowrap;
 }
 

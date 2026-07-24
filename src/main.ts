@@ -22,7 +22,8 @@ const VOXEL_SIZE = 0.02; // internal fine grid (2 cm)
 const MIN_M = 0.3; // accumulate depths in [MIN_M, MAX_M]; ARCore is most accurate 0.5–5 m
 const MAX_M = 3.0; // far depth is noisiest; capping the range curbs drift and spurious voxels
 const STRIDE = 2; // subsample the depth buffer (every 2nd texel)
-const MIN_OBS = 3; // render/keep a voxel once seen at least this many times (rejects transient noise)
+const MIN_OBS_DEFAULT = 6; // net observations before a cell draws; higher = cleaner but sparser
+const MIN_OBS_MAX = 14; // slider range for scan stability
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
@@ -47,6 +48,7 @@ interface ScanState {
   camFlipX: boolean;
   camFlipY: boolean;
   displayFactor: number; // display/export voxel size = displayFactor × base (2cm); 1 = live 2cm
+  minObs: number; // net observations before a cell is drawn/kept (scan-stability threshold)
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -55,7 +57,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 6: ボクセルサイズ可変 — 上で AR スキャン、下に俯瞰プレビュー。表示サイズスライダーで再スキャンなしにボクセルの粗さを変えられます。',
+        'Phase 6: 上で AR スキャン、下に俯瞰プレビュー。表示サイズと「スキャン安定性」をスライダーで調整でき、浮いたボクセルは近づくと消えます（カービング）。',
     }),
   ]);
 
@@ -115,6 +117,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     camFlipX: false,
     camFlipY: true,
     displayFactor: 1,
+    minObs: MIN_OBS_DEFAULT,
   };
   const heightColor = new THREE.Color();
   const camRGB: RGB = { r: 0, g: 0, b: 0 };
@@ -138,6 +141,20 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     sizeSlider,
     sizeLabel,
   ]);
+  const stabSlider = el('input', {
+    type: 'range',
+    min: '3',
+    max: String(MIN_OBS_MAX),
+    step: '1',
+    value: String(MIN_OBS_DEFAULT),
+    className: 'size-slider',
+  });
+  const stabLabel = el('span', { className: 'size-label', textContent: String(MIN_OBS_DEFAULT) });
+  const stabRow = el('div', { className: 'size-row' }, [
+    el('span', { className: 'size-cap', textContent: 'スキャン安定性' }),
+    stabSlider,
+    stabLabel,
+  ]);
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
   const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
   const colorBtn = el('button', { className: 'ctl', textContent: '🎨 色: カメラ' });
@@ -146,11 +163,12 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 6: ボクセルサイズ可変（表示スライダー）',
+      textContent: 'Phase 6: スキャン品質（安定性スライダー＋カービング）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
     sizeRow,
+    stabRow,
     el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
@@ -165,7 +183,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     pauseBtn.textContent = state.accumulating ? '⏸ 一時停止' : '▶ 再開';
     // Coarse view doesn't refresh while scanning; toggling pause re-tessellates it with the
     // latest data so you can inspect what you've captured.
-    if (state.displayFactor > 1) voxels.rebuildDownsampled(grid, state.displayFactor, MIN_OBS);
+    if (state.displayFactor > 1) voxels.rebuildDownsampled(grid, state.displayFactor, state.minObs);
   });
   clearBtn.addEventListener('click', () => {
     grid.clear();
@@ -204,7 +222,25 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       voxels.reset();
       grid.markAllDirty(); // the next applyUpdates() re-seeds every cell at base 2cm
     } else {
-      voxels.rebuildDownsampled(grid, f, MIN_OBS);
+      voxels.rebuildDownsampled(grid, f, state.minObs);
+    }
+  });
+
+  // Scan-stability threshold (minObs). Higher rejects more noise (thinner, cleaner surfaces) but
+  // needs more looks. Dragging updates the label; releasing re-tessellates the already-scanned
+  // cells at the new threshold — no re-scan.
+  stabSlider.addEventListener('input', () => {
+    stabLabel.textContent = stabSlider.value;
+  });
+  stabSlider.addEventListener('change', () => {
+    const n = Math.min(MIN_OBS_MAX, Math.max(3, parseInt(stabSlider.value, 10) || MIN_OBS_DEFAULT));
+    state.minObs = n;
+    stabLabel.textContent = String(n);
+    if (state.displayFactor === 1) {
+      voxels.reset();
+      grid.markAllDirty();
+    } else {
+      voxels.rebuildDownsampled(grid, state.displayFactor, n);
     }
   });
 
@@ -335,7 +371,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // full aggregation sweep of a large grid is too heavy to run every frame — so here we just
     // discard the renderer's dirty keys to keep that set bounded.
     if (state.displayFactor === 1) {
-      voxels.applyUpdates(grid, MIN_OBS);
+      voxels.applyUpdates(grid, state.minObs);
       // Free-space carving: remove voxels floating in front of the measured surface, so getting
       // closer clears noise. Amortized (a slice of instances per frame). Base size only.
       if (latestDepth && state.accumulating) {
@@ -344,7 +380,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
           margin: CARVE_MARGIN,
           minDepth: CARVE_MIN_DEPTH,
         });
-        voxels.carve(grid, carveCtx, MIN_OBS, CARVE_BUDGET);
+        voxels.carve(grid, carveCtx, state.minObs, CARVE_BUDGET);
       }
     } else {
       grid.clearDirty();
@@ -354,7 +390,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // visibly grows while the AR view scans on top.
     if (time - lastPreview >= PREVIEW_MS) {
       lastPreview = time;
-      overhead.update(grid, MIN_OBS);
+      overhead.update(grid, state.minObs);
     }
 
     if (time - lastStats >= STATS_MS) {
@@ -423,6 +459,7 @@ function updateStats(
       label: '表示サイズ',
       value: `${state.displayFactor * 2}cm${state.displayFactor > 1 ? ` (×${state.displayFactor})` : ''}`,
     },
+    { label: '安定性(minObs)', value: `${state.minObs}` },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
     { label: '色', value: colorStatus },
     {
