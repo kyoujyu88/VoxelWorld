@@ -3,7 +3,7 @@ import * as THREE from 'three';
 import { probeXRSupport } from './xr/capabilities';
 import { requestArSession, readSessionInfo, type SessionInfo } from './xr/session';
 import { readCpuDepthFrame, type CpuDepthFrame } from './xr/depth';
-import { reprojectDepthFrame } from './xr/reproject';
+import { reprojectDepthFrame, type ReprojectStats } from './xr/reproject';
 import { computeDepthStats } from './render/depthHeatmap';
 import { CameraColorReader, type RGB } from './xr/cameraColor';
 import { VoxelGrid } from './voxel/grid';
@@ -30,6 +30,7 @@ const MIN_W_DEFAULT = 3; // accumulated weight a cell needs before it is drawn
 const MIN_W_MAX = 12; // slider max
 const FREE_WEIGHT = 2; // weight of one "I see through here" observation from the carve pass
 const TRUNCATION = 0.04; // ±4cm band around a hit that each measurement updates (2 voxels)
+const EDGE_SLANT = 8; // slant (~83°) above which a sample straddles a depth edge and is dropped
 const STATS_MS = 250; // HUD stats / thumbnail / FPS update cadence
 const PREVIEW_MS = 150; // overhead preview redraw cadence (~7 Hz; incremental)
 const CAMERA_MS = 100; // camera-image readback cadence (~10 Hz; readback is a GPU stall)
@@ -191,6 +192,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
   const overhead = new OverheadPreview(overheadCanvas);
   const carveCtx = new CarveContext();
+  const reprojectStats: ReprojectStats = { emitted: 0, rejectedEdge: 0 };
 
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
@@ -325,9 +327,12 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     u: number,
     v: number,
     depth: number,
+    quality: number,
   ): void => {
     const d = depth > 0.3 ? depth : 0.3; // clamp at the minimum useful range
-    const w = 1 / (d * d);
+    // Confidence falls off with distance (depth error grows steeply) and with surface slant
+    // (a grazing ray pins the surface poorly along itself).
+    const w = quality / (d * d);
     let r: number;
     let g: number;
     let b: number;
@@ -391,8 +396,15 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         latestDepth,
         view.projectionMatrix,
         view.transform.matrix,
-        { minMeters: MIN_M, maxMeters: MAX_M, stride: STRIDE, flipY: true },
+        {
+          minMeters: MIN_M,
+          maxMeters: MAX_M,
+          stride: STRIDE,
+          flipY: true,
+          edgeSlant: EDGE_SLANT,
+        },
         accumulate,
+        reprojectStats,
       );
     }
 
@@ -429,7 +441,17 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       frameCount = 0;
       fpsWindowStart = time;
       lastStats = time;
-      updateStats(statsSlot, info, state, grid, voxels.drawn, latestDepth, cameraReader, fps);
+      updateStats(
+        statsSlot,
+        info,
+        state,
+        grid,
+        voxels.drawn,
+        latestDepth,
+        cameraReader,
+        fps,
+        reprojectStats,
+      );
       drawThumbnail(thumbCanvas, cameraReader);
     }
   });
@@ -469,6 +491,7 @@ function updateStats(
   depth: CpuDepthFrame | null,
   reader: CameraColorReader | null,
   fps: number,
+  reprojectStats: ReprojectStats,
 ): void {
   const colorStatus =
     state.colorMode === 'height'
@@ -490,6 +513,12 @@ function updateStats(
       value: `${state.displayFactor * 2}cm${state.displayFactor > 1 ? ` (×${state.displayFactor})` : ''}`,
     },
     { label: 'ノイズ除去', value: `${state.minWeight} / ${MAX_WEIGHT}` },
+    {
+      label: 'エッジ除去',
+      value: `${reprojectStats.rejectedEdge.toLocaleString()} / ${(
+        reprojectStats.emitted + reprojectStats.rejectedEdge
+      ).toLocaleString()}`,
+    },
     { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
     { label: '色', value: colorStatus },
     {
