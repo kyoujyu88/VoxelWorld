@@ -26,6 +26,9 @@ interface DepthStateInitLike {
  * - depth-sensing is REQUIRED (the whole app depends on it).
  * - camera-access is OPTIONAL: needed for per-voxel color, but the session should still
  *   start (geometry only) if the user denies it.
+ * - plane-detection is OPTIONAL: ARCore's own flat-surface fit for walls and floors, which
+ *   would let large planar regions stop being thousands of separately-fused voxels. Asking
+ *   for it costs nothing when unsupported, and `readPlaneProbe` reports what we actually got.
  * - We prefer cpu-optimized + luminance-alpha (only luminance-alpha is guaranteed), with
  *   gpu-optimized / float32 listed as fallbacks in priority order.
  */
@@ -39,7 +42,7 @@ export function buildSessionInit(config: SessionFeatureConfig = {}): XRSessionIn
   // installed @types/webxr, and sidesteps excess-property checks on the literal.
   const init: Record<string, unknown> = {
     requiredFeatures: ['depth-sensing'],
-    optionalFeatures: ['camera-access', 'dom-overlay', 'local-floor'],
+    optionalFeatures: ['camera-access', 'dom-overlay', 'local-floor', 'plane-detection'],
     depthSensing,
   };
   if (config.overlayRoot) {
@@ -120,6 +123,54 @@ export function readDepthProbe(frame: XRFrame, view: XRView): DepthProbe {
     height: depthInfo.height,
     rawValueToMeters: depthInfo.rawValueToMeters,
   };
+}
+
+export interface PlaneProbe {
+  /** Whether the runtime exposes detected planes at all on this session. */
+  available: boolean;
+  /** How many planes are currently tracked (0 until the runtime has fitted some). */
+  count: number;
+  /** Split by orientation, which is what tells a floor/ceiling from a wall. */
+  horizontal: number;
+  vertical: number;
+}
+
+interface PlaneLike {
+  orientation?: string;
+}
+
+/**
+ * Report ARCore's own plane fit for this frame.
+ *
+ * Reading `detectedPlanes` throws outright when the feature was not enabled — the spec has an
+ * open issue about how ungraceful that is (immersive-web/real-world-geometry#30) — so the access
+ * is wrapped rather than feature-detected. `available: false` means the runtime gave us nothing,
+ * which on Chrome/ARCore is how "plane-detection was not granted" shows up.
+ */
+export function readPlaneProbe(frame: XRFrame): PlaneProbe {
+  let planes: Iterable<PlaneLike> | undefined;
+  try {
+    planes = (frame as unknown as { detectedPlanes?: Iterable<PlaneLike> }).detectedPlanes;
+  } catch {
+    planes = undefined;
+  }
+  if (!planes || typeof (planes as { forEach?: unknown }).forEach !== 'function') {
+    return { available: false, count: 0, horizontal: 0, vertical: 0 };
+  }
+
+  let count = 0;
+  let horizontal = 0;
+  let vertical = 0;
+  try {
+    for (const plane of planes) {
+      count++;
+      if (plane.orientation === 'horizontal') horizontal++;
+      else if (plane.orientation === 'vertical') vertical++;
+    }
+  } catch {
+    // A plane whose tracking was lost throws on property access; keep what we counted.
+  }
+  return { available: true, count, horizontal, vertical };
 }
 
 export interface CameraProbe {
