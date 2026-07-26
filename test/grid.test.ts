@@ -496,3 +496,140 @@ describe('dirty sets track only drawable cells', () => {
     expect(dirtyCount(g)).toBe(2);
   });
 });
+
+describe('hash table storage', () => {
+  /** Carve a cell until the grid drops it entirely. */
+  const carveAway = (g: VoxelGrid, key: number): void => {
+    for (let i = 0; i < 200; i++) {
+      g.integrateFree(key, 5, 1);
+      const out = view();
+      if (!g.readVoxel(key, out)) return;
+    }
+    throw new Error('cell was never deleted');
+  };
+
+  it('keeps every cell findable and intact across the rehashes that filling it forces', () => {
+    // Far more cells than the initial table holds, so this spans several doublings. Cells are
+    // addressed by their centers: i * voxelSize alone lands on a bin boundary where float error
+    // can floor into the neighbouring cell.
+    const N = 60_000;
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 1_000_000 });
+    for (let i = 0; i < N; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, i + 1);
+    expect(g.size).toBe(N);
+
+    const out = view();
+    for (let i = 0; i < N; i++) {
+      const key = packKey(i, 0, 0) as number;
+      expect(g.readVoxel(key, out)).toBe(true);
+      expect(out.weight).toBeCloseTo(Math.min(i + 1, g.maxWeight), 4);
+      expect(out.cx).toBeCloseTo(i * 0.02 + 0.01, 6);
+    }
+  });
+
+  it('separates cells whose coordinates are permutations of each other', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.integrate(0.03, 0.05, 0.07, 0, 5);
+    g.integrate(0.07, 0.05, 0.03, 0, 9);
+    expect(g.size).toBe(2);
+    const out = view();
+    g.readVoxel(packKey(1, 2, 3) as number, out);
+    expect(out.weight).toBeCloseTo(5, 6);
+    g.readVoxel(packKey(3, 2, 1) as number, out);
+    expect(out.weight).toBeCloseTo(9, 6);
+  });
+
+  it('finds a cell that hashed past a deleted one (deletion leaves a probe marker)', () => {
+    // Insert a run, delete from the middle, then confirm the rest is still reachable.
+    const N = 400;
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    for (let i = 0; i < N; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, 3);
+    for (let i = 0; i < N; i += 2) carveAway(g, packKey(i, 0, 0) as number);
+    expect(g.size).toBe(N / 2);
+
+    const out = view();
+    for (let i = 1; i < N; i += 2) {
+      expect(g.readVoxel(packKey(i, 0, 0) as number, out)).toBe(true);
+      expect(out.weight).toBeCloseTo(3, 6);
+    }
+    for (let i = 0; i < N; i += 2) {
+      expect(g.readVoxel(packKey(i, 0, 0) as number, out)).toBe(false);
+    }
+  });
+
+  it('reuses deleted slots instead of growing without bound', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    // Churn the same cells many times over; a leak would show up as a rising size.
+    for (let round = 0; round < 40; round++) {
+      for (let i = 0; i < 200; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, 3);
+      expect(g.size).toBe(200);
+      for (let i = 0; i < 200; i++) carveAway(g, packKey(i, 0, 0) as number);
+      expect(g.size).toBe(0);
+    }
+  });
+
+  it('brings a carved-away cell back correctly when it is measured again', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    const key = packKey(0, 0, 0) as number;
+    g.integrate(0, 0, 0, 0, 3, 200, 100, 50, 3);
+    carveAway(g, key);
+    expect(g.size).toBe(0);
+
+    g.integrate(0, 0, 0, 0, 7, 10, 20, 30, 7);
+    const out = view();
+    expect(g.readVoxel(key, out)).toBe(true);
+    expect(out.weight).toBeCloseTo(7, 6); // a fresh cell, not the old one resurrected
+    expect(out.sdf).toBeCloseTo(0, 6);
+    expect(out.r).toBeCloseTo(10, 4);
+  });
+
+  it('honours maxVoxels and reports what it dropped', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 100 });
+    for (let i = 0; i < 150; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, 1);
+    expect(g.size).toBe(100);
+    expect(g.droppedAtCap).toBe(50);
+    // The cells that did fit are still intact.
+    const out = view();
+    expect(g.readVoxel(packKey(0, 0, 0) as number, out)).toBe(true);
+  });
+
+  it('still updates a stored cell after the cap is reached', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 2, maxWeight: 100 });
+    g.integrate(0, 0, 0, 0, 1);
+    g.integrate(0.03, 0, 0, 0, 1);
+    g.integrate(0.05, 0, 0, 0, 1); // dropped
+    g.integrate(0, 0, 0, 0, 9); // existing cell: must still fuse
+    const out = view();
+    g.readVoxel(packKey(0, 0, 0) as number, out);
+    expect(out.weight).toBeCloseTo(10, 6);
+  });
+
+  it('rejects cells outside the packed-key range rather than storing what it cannot address', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    g.integrate(70000 * 0.02 + 0.01, 0, 0, 0, 1); // xi = 70000, past the ±65536 limit
+    expect(g.size).toBe(0);
+  });
+
+  it('empties completely on clear, including bounds', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02 });
+    for (let i = 0; i < 5000; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, 3);
+    expect(g.getBounds()).not.toBeNull();
+    g.clear();
+    expect(g.size).toBe(0);
+    expect(g.getBounds()).toBeNull();
+    const out = view();
+    expect(g.readVoxel(packKey(0, 0, 0) as number, out)).toBe(false);
+    // ...and is reusable afterwards.
+    g.integrate(0, 0, 0, 0, 3);
+    expect(g.size).toBe(1);
+  });
+
+  it('keeps iteration consistent with lookups after growth', () => {
+    const N = 40_000;
+    const g = new VoxelGrid({ voxelSize: 0.02, maxVoxels: 1_000_000 });
+    for (let i = 0; i < N; i++) g.integrate(i * 0.02 + 0.01, 0, 0, 0, 5);
+    let visited = 0;
+    g.forEachSurfacePoint(1, () => visited++);
+    expect(visited).toBe(N);
+    expect(g.countSurface(1)).toBe(N);
+  });
+});
