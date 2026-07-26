@@ -34,7 +34,7 @@ import {
   Group,
   type BufferGeometry,
 } from 'three';
-import { unpackKey, type VoxelGrid, type VoxelView } from '../voxel/grid';
+import type { VoxelGrid, VoxelView } from '../voxel/grid';
 import { carveWeightScale, type CarveContext } from '../xr/carve';
 
 const BASE_FILL = 0.9; // near-solid 2cm cubes — a grid of Minecraft-like blocks
@@ -311,7 +311,6 @@ export class VoxelRenderer {
     if (layer.drawn === 0) return 0;
     const other = tierIsConfirmed ? this.provisional : this.confirmed;
     const size = this.voxelSize * BASE_FILL;
-    const half = this.voxelSize * 0.5;
     let examined = 0;
     let removed = 0;
     let i = layer.cursor;
@@ -342,16 +341,10 @@ export class VoxelRenderer {
         continue; // slot i now holds the moved instance (or i == drawn); re-examine it
       }
 
-      // 3. Does the current view see through it?
+      // 3. Does the current view see through it? readVoxel already gave us the cell center, so
+      // re-deriving it from the key here would repeat an unpack (and allocate) 16k times a frame.
       if (ctx.ready) {
-        const { xi, yi, zi } = unpackKey(key);
-        if (
-          ctx.testFree(
-            xi * this.voxelSize + half,
-            yi * this.voxelSize + half,
-            zi * this.voxelSize + half,
-          )
-        ) {
+        if (ctx.testFree(v.cx, v.cy, v.cz)) {
           // Erase with the same distance falloff fusion uses, and let the grid refuse the edit
           // outright when the cell is confirmed and this view is a far worse look than the one
           // that confirmed it.

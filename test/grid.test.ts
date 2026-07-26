@@ -75,7 +75,8 @@ describe('VoxelGrid.integrate', () => {
     const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.05 });
     g.integrate(0, 0, 0, 10, 1); // absurdly far in front
     const out = view();
-    g.readVoxel(soleKey(g), out);
+    // Not soleKey: a cell this far off the surface is deliberately not marked dirty.
+    g.readVoxel(originKey, out);
     expect(out.sdf).toBeCloseTo(0.05, 6);
   });
 
@@ -448,5 +449,50 @@ describe('confidence: locking a confirmed cell', () => {
     let surface = true;
     for (let i = 0; i < 50 && surface; i++) surface = g.integrateFree(key, 5, 1, 3.0);
     expect(surface).toBe(false);
+  });
+});
+
+describe('dirty sets track only drawable cells', () => {
+  /** Count the keys the renderer's dirty set reports. */
+  const dirtyCount = (g: VoxelGrid): number => {
+    let n = 0;
+    g.drainDirty(() => n++);
+    return n;
+  };
+
+  it('reports a cell that is on the zero crossing', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0, 1); // sdf 0: squarely on the surface
+    expect(dirtyCount(g)).toBe(1);
+  });
+
+  it('skips a cell far off the crossing, which both consumers would discard anyway', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0.05, 1); // 5 cm of free space in front of the surface
+    expect(g.size).toBe(1); // still stored — it carries free-space evidence
+    expect(dirtyCount(g)).toBe(0); // but nothing can draw or paint it
+  });
+
+  it('reports a cell the moment fusion pulls it into the band', () => {
+    const g = new VoxelGrid({
+      voxelSize: 0.02,
+      truncation: 0.06,
+      surfaceBand: 0.015,
+      maxWeight: 100,
+    });
+    g.integrate(0, 0, 0, 0.05, 1);
+    expect(dirtyCount(g)).toBe(0);
+    // A much heavier measurement at the surface drags the average back inside the band.
+    g.integrate(0, 0, 0, 0, 50);
+    expect(dirtyCount(g)).toBe(1);
+  });
+
+  it('still re-reports every stored cell on markAllDirty, so slider changes re-classify all', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.015 });
+    g.integrate(0, 0, 0, 0.05, 1); // out of band
+    g.integrate(0.05, 0, 0, 0, 1); // in band
+    expect(g.size).toBe(2);
+    g.markAllDirty();
+    expect(dirtyCount(g)).toBe(2);
   });
 });
