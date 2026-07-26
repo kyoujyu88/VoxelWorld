@@ -152,25 +152,22 @@ export class OverheadPreview {
       return;
     }
 
-    // If any new surface cell now falls outside the current fit, refit + full rebuild.
+    // Paint the new voxels into the persistent buffer as we go. A cell landing outside the
+    // current fit forces a refit + full rebuild, which clears the buffer anyway — so bail out the
+    // moment one escapes rather than walking (and re-reading) the whole list a second time first.
+    const f = this.fit;
     for (const key of this.pending) {
       if (!grid.readVoxel(key, this.scratch)) continue;
-      if (this.scratch.weight < minWeight) continue;
-      if (Math.abs(this.scratch.sdf) > grid.surfaceBand) continue;
-      const p = worldToPixel(this.fit, this.scratch.cx, this.scratch.cz);
-      if (p.px < 0 || p.px >= this.width || p.py < 0 || p.py >= this.height) {
+      const s = this.scratch;
+      if (s.weight < minWeight) continue;
+      if (Math.abs(s.sdf) > grid.surfaceBand) continue;
+      const px = Math.round(f.cxPix + (s.cx - f.cxWorld) * f.scale);
+      const py = Math.round(f.cyPix + (s.cz - f.czWorld) * f.scale);
+      if (px < 0 || px >= this.width || py < 0 || py >= this.height) {
         this.rebuild(grid, minWeight);
         return;
       }
-    }
-
-    // Otherwise paint just the new voxels into the persistent buffer.
-    for (const key of this.pending) {
-      if (!grid.readVoxel(key, this.scratch)) continue;
-      if (this.scratch.weight < minWeight) continue;
-      if (Math.abs(this.scratch.sdf) > grid.surfaceBand) continue;
-      const s = this.scratch;
-      this.paint(s.cx, s.cy, s.cz, s.r, s.g, s.b, s.confirmed);
+      this.paintAt(px, py, s.cy, s.r, s.g, s.b, s.confirmed);
     }
     this.blit();
   }
@@ -208,11 +205,25 @@ export class OverheadPreview {
     confirmed: boolean,
   ): void {
     const f = this.fit;
-    const data = this.data;
-    if (!f || !data) return;
+    if (!f) return;
     const px = Math.round(f.cxPix + (cx - f.cxWorld) * f.scale);
     const py = Math.round(f.cyPix + (cz - f.czWorld) * f.scale);
     if (px < 0 || px >= this.width || py < 0 || py >= this.height) return;
+    this.paintAt(px, py, cy, r, g, b, confirmed);
+  }
+
+  /** Paint at an already-projected, already-bounds-checked pixel. */
+  private paintAt(
+    px: number,
+    py: number,
+    cy: number,
+    r: number,
+    g: number,
+    b: number,
+    confirmed: boolean,
+  ): void {
+    const data = this.data;
+    if (!data) return;
     const idx = py * this.width + px;
     if (cy <= this.topY[idx]) return; // a higher voxel already owns this pixel
     this.topY[idx] = cy;

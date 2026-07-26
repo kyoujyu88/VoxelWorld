@@ -294,8 +294,14 @@ export class VoxelGrid {
       rec.cw = cwNew > this.maxWeight ? this.maxWeight : cwNew;
     }
 
-    this.dirty.add(key);
-    this.dirtyPreview.add(key);
+    // Only a cell on the zero crossing can be drawn or painted, and both consumers discard the
+    // rest the moment they read them. The band a measurement writes is wider than the surface
+    // band, so filtering here drops most of the traffic — and with it most of the work the
+    // incremental draw and the overhead preview do walking their dirty sets.
+    if (rec.sdf <= this.surfaceBand && rec.sdf >= -this.surfaceBand) {
+      this.dirty.add(key);
+      this.dirtyPreview.add(key);
+    }
   }
 
   /**
@@ -398,11 +404,17 @@ export class VoxelGrid {
   readVoxel(key: number, out: VoxelView): boolean {
     const rec = this.cells.get(key);
     if (rec === undefined) return false;
-    const { xi, yi, zi } = unpackKey(key);
+    // Inline unpackKey rather than call it: this runs tens of thousands of times per frame (the
+    // carve walk alone is 16k), and returning a { xi, yi, zi } object each time made it one of the
+    // biggest sources of garbage in the loop.
+    const z = key % BASE;
+    const afterZ = (key - z) / BASE;
+    const y = afterZ % BASE;
+    const x = (afterZ - y) / BASE;
     const half = this.voxelSize * 0.5;
-    out.cx = xi * this.voxelSize + half;
-    out.cy = yi * this.voxelSize + half;
-    out.cz = zi * this.voxelSize + half;
+    out.cx = (x - OFFSET) * this.voxelSize + half;
+    out.cy = (y - OFFSET) * this.voxelSize + half;
+    out.cz = (z - OFFSET) * this.voxelSize + half;
     out.r = rec.r;
     out.g = rec.g;
     out.b = rec.b;

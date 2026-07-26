@@ -89,7 +89,9 @@ describe('fuseDepthSample', () => {
   });
 
   it('colors only the cells near the surface, not the whole band', () => {
-    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06 });
+    // surfaceBand wide enough to cover the whole truncation band, so drainDirty enumerates every
+    // cell the sample touched. Colouring is governed by colorBand, which this does not affect.
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, surfaceBand: 0.1 });
     fuseDepthSample(g, CAM.x, CAM.y, CAM.z, HIT.x, HIT.y, HIT.z, 1, 1, 250, 250, 250);
 
     // Inspect every cell the sample touched.
