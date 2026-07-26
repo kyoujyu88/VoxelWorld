@@ -1,5 +1,10 @@
 import { describe, it, expect } from 'vitest';
-import { computeFit, worldToPixel, niceBarMeters } from '../src/render/overheadPreview';
+import {
+  computeFit,
+  worldToPixel,
+  niceBarMeters,
+  blendToBackground,
+} from '../src/render/overheadPreview';
 
 describe('computeFit', () => {
   it('fills a square box into a square canvas and centers it', () => {
@@ -50,5 +55,27 @@ describe('niceBarMeters', () => {
 
   it('falls back to the smallest candidate when nothing fits', () => {
     expect(niceBarMeters(1000, 30)).toBe(0.25);
+  });
+});
+
+describe('blendToBackground', () => {
+  it('returns the color untouched at full alpha', () => {
+    expect(blendToBackground(200, 18, 1)).toBeCloseTo(200, 9);
+  });
+
+  it('returns the background at zero alpha', () => {
+    expect(blendToBackground(200, 18, 0)).toBeCloseTo(18, 9);
+  });
+
+  it('lands between the two, nearer the background when faint', () => {
+    const v = blendToBackground(200, 18, 0.35);
+    expect(v).toBeGreaterThan(18);
+    expect(v).toBeLessThan(200);
+    expect(v).toBeCloseTo(200 * 0.35 + 18 * 0.65, 9);
+  });
+
+  it('keeps a dark voxel darker than the background from washing out', () => {
+    // Blending is symmetric: it moves toward the background from either side.
+    expect(blendToBackground(0, 18, 0.35)).toBeCloseTo(18 * 0.65, 9);
   });
 });

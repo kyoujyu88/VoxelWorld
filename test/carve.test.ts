@@ -1,6 +1,6 @@
 import { describe, it, expect } from 'vitest';
 import { PerspectiveCamera, Matrix4 } from 'three';
-import { CarveContext, isFreeSpace } from '../src/xr/carve';
+import { CarveContext, isFreeSpace, carveWeightScale } from '../src/xr/carve';
 import type { CpuDepthFrame } from '../src/xr/depth';
 
 /** A 2×2 depth frame whose center texel (col 1, row 1) reads `measuredAtCenter` meters. */
@@ -63,5 +63,32 @@ describe('CarveContext', () => {
     const ctx = new CarveContext();
     ctx.update(proj, identityView, depthFrame(3), opts);
     expect(ctx.testFree(0, 0, 2)).toBe(false); // +Z is behind (camera looks down -Z)
+  });
+});
+
+describe('carveWeightScale', () => {
+  it('is 1 at one metre, the normalization point', () => {
+    expect(carveWeightScale(1)).toBeCloseTo(1, 9);
+  });
+
+  it('erases harder up close and far more gently at range', () => {
+    expect(carveWeightScale(0.5)).toBeCloseTo(4, 6);
+    expect(carveWeightScale(2)).toBeCloseTo(0.25, 6);
+    // Matching fusion's falloff is the point: a 3 m view no longer outguns a 0.5 m one.
+    expect(carveWeightScale(3)).toBeLessThan(carveWeightScale(0.5) / 30);
+  });
+
+  it('clamps very near distances so the weight cannot blow up', () => {
+    expect(carveWeightScale(0.001, 0.3)).toBeCloseTo(carveWeightScale(0.3, 0.3), 9);
+    expect(Number.isFinite(carveWeightScale(0, 0.3))).toBe(true);
+  });
+
+  it('decreases monotonically with distance', () => {
+    let prev = Infinity;
+    for (const d of [0.4, 0.8, 1.5, 3, 6]) {
+      const w = carveWeightScale(d);
+      expect(w).toBeLessThan(prev);
+      prev = w;
+    }
   });
 });

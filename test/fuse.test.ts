@@ -2,7 +2,17 @@ import { describe, it, expect } from 'vitest';
 import { VoxelGrid, packKey, type VoxelView } from '../src/voxel/grid';
 import { fuseDepthSample } from '../src/voxel/fuse';
 
-const view = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, weight: 0, sdf: 0 });
+const view = (): VoxelView => ({
+  cx: 0,
+  cy: 0,
+  cz: 0,
+  r: 0,
+  g: 0,
+  b: 0,
+  weight: 0,
+  sdf: 0,
+  confirmed: false,
+});
 
 /** Read the cell containing a world point. */
 function cellAt(g: VoxelGrid, x: number, y: number, z: number): VoxelView | null {
@@ -102,5 +112,53 @@ describe('fuseDepthSample', () => {
     expect(fuseDepthSample(g, 0, 0, 0, 0, 0, -1, 1, 0, 0, 0, 0)).toBe(0); // weight 0
     expect(fuseDepthSample(g, 0, 0, 0, 0, 0, 0, 1, 1, 0, 0, 0)).toBe(0); // zero-length ray
     expect(g.size).toBe(0);
+  });
+});
+
+describe('fuseDepthSample confidence', () => {
+  /** Confirmation reachable only by distance, so `confirmed` reads out bestDepth directly. */
+  const distanceOnly = (confirmDist: number): VoxelGrid =>
+    new VoxelGrid({
+      voxelSize: 0.02,
+      truncation: 0.04,
+      confirmWeight: 0.001,
+      confirmDist,
+      confirmDirs: 99,
+    });
+
+  it('records the measurement distance itself, not a multiple of it', () => {
+    // The band writes ~4 cells per measurement. If those calls accumulated instead of taking a
+    // min, the stored distance would be some multiple of 1 m and both bounds below would fail.
+    const near = distanceOnly(1.05);
+    fuseDepthSample(near, CAM.x, CAM.y, CAM.z, HIT.x, HIT.y, HIT.z, 1, 1, 0, 0, 0);
+    expect(cellAt(near, HIT.x, HIT.y, HIT.z)?.confirmed).toBe(true); // 1.0 m <= 1.05
+
+    const far = distanceOnly(0.95);
+    fuseDepthSample(far, CAM.x, CAM.y, CAM.z, HIT.x, HIT.y, HIT.z, 1, 1, 0, 0, 0);
+    expect(cellAt(far, HIT.x, HIT.y, HIT.z)?.confirmed).toBe(false); // 1.0 m > 0.95
+  });
+
+  /** Confirmation reachable only by direction diversity, so `confirmed` reads out dirMask. */
+  const directionsOnly = (confirmDirs: number): VoxelGrid =>
+    new VoxelGrid({
+      voxelSize: 0.02,
+      truncation: 0.04,
+      confirmWeight: 0.001,
+      confirmDist: 0.0001,
+      confirmDirs,
+    });
+
+  it('counts one measurement as one direction, whatever its band touched', () => {
+    const g = directionsOnly(2);
+    fuseDepthSample(g, CAM.x, CAM.y, CAM.z, HIT.x, HIT.y, HIT.z, 1, 1, 0, 0, 0);
+    expect(cellAt(g, HIT.x, HIT.y, HIT.z)?.confirmed).toBe(false);
+  });
+
+  it('confirms once the same cell is measured from a second direction', () => {
+    const g = directionsOnly(2);
+    fuseDepthSample(g, CAM.x, CAM.y, CAM.z, HIT.x, HIT.y, HIT.z, 1, 1, 0, 0, 0);
+    // Same surface point, camera moved 90 degrees around it (still 1 m away).
+    fuseDepthSample(g, 1, 0, -1, HIT.x, HIT.y, HIT.z, 1, 1, 0, 0, 0);
+    expect(cellAt(g, HIT.x, HIT.y, HIT.z)?.confirmed).toBe(true);
   });
 });

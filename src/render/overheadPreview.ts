@@ -72,6 +72,16 @@ export function worldToPixel(f: FitTransform, x: number, z: number): { px: numbe
   };
 }
 
+/**
+ * Mix one color channel toward the background. The preview writes with `putImageData`, which
+ * *replaces* pixels rather than compositing, so a low alpha would make the canvas itself
+ * see-through instead of making the voxel look faint. Blending toward the background here gives
+ * the same "not confirmed yet" reading the 3D view gets from a translucent material.
+ */
+export function blendToBackground(channel: number, bg: number, alpha: number): number {
+  return channel * alpha + bg * (1 - alpha);
+}
+
 /** Choose a "nice" scale-bar length (meters) that fits within `maxPx` at the given px/m scale. */
 export function niceBarMeters(scale: number, maxPx: number): number {
   const candidates = [0.25, 0.5, 1, 2, 5, 10];
@@ -86,6 +96,8 @@ const PREVIEW_W = 360;
 const PREVIEW_H = 240;
 const PAD = 12;
 const BG: [number, number, number] = [18, 20, 26];
+/** Matches the 3D view's provisional opacity, so both halves of the screen agree. */
+const PROVISIONAL_ALPHA = 0.35;
 // Fit margin so ordinary growth stays inside the current fit and doesn't trigger a rebuild.
 const FIT_MARGIN_FRAC = 0.08;
 const FIT_MARGIN_MIN_M = 0.25;
@@ -108,6 +120,7 @@ export class OverheadPreview {
     b: 0,
     weight: 0,
     sdf: 0,
+    confirmed: false,
   };
 
   constructor(canvas: HTMLCanvasElement) {
@@ -157,7 +170,7 @@ export class OverheadPreview {
       if (this.scratch.weight < minWeight) continue;
       if (Math.abs(this.scratch.sdf) > grid.surfaceBand) continue;
       const s = this.scratch;
-      this.paint(s.cx, s.cy, s.cz, s.r, s.g, s.b);
+      this.paint(s.cx, s.cy, s.cz, s.r, s.g, s.b, s.confirmed);
     }
     this.blit();
   }
@@ -178,12 +191,22 @@ export class OverheadPreview {
       PAD,
     );
     this.clearBuffers();
-    grid.forEachSurfacePoint(minWeight, (cx, cy, cz, r, g, bl) => this.paint(cx, cy, cz, r, g, bl));
+    grid.forEachSurfacePoint(minWeight, (cx, cy, cz, r, g, bl, confirmed) =>
+      this.paint(cx, cy, cz, r, g, bl, confirmed),
+    );
     this.blit();
   }
 
   /** Paint one voxel into the persistent buffer with a top-down z-test (topmost color wins). */
-  private paint(cx: number, cy: number, cz: number, r: number, g: number, b: number): void {
+  private paint(
+    cx: number,
+    cy: number,
+    cz: number,
+    r: number,
+    g: number,
+    b: number,
+    confirmed: boolean,
+  ): void {
     const f = this.fit;
     const data = this.data;
     if (!f || !data) return;
@@ -194,9 +217,10 @@ export class OverheadPreview {
     if (cy <= this.topY[idx]) return; // a higher voxel already owns this pixel
     this.topY[idx] = cy;
     const d = idx * 4;
-    data[d] = r; // Uint8ClampedArray rounds + clamps the float means
-    data[d + 1] = g;
-    data[d + 2] = b;
+    const a = confirmed ? 1 : PROVISIONAL_ALPHA;
+    data[d] = blendToBackground(r, BG[0], a); // Uint8ClampedArray rounds + clamps the float means
+    data[d + 1] = blendToBackground(g, BG[1], a);
+    data[d + 2] = blendToBackground(b, BG[2], a);
     data[d + 3] = 255;
   }
 

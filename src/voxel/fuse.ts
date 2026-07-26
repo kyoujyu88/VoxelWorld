@@ -13,7 +13,7 @@
  * unit ray by `s * (rayLength / depth)` moves exactly `s` in perpendicular depth.
  */
 
-import type { VoxelGrid } from './grid';
+import { azimuthBit, type VoxelGrid } from './grid';
 
 export interface FuseOptions {
   /** How far in front of the hit (toward the camera) to mark free (m). Default: grid truncation. */
@@ -72,13 +72,18 @@ export function fuseDepthSample(
   const uy = dy * k;
   const uz = dz * k;
 
+  // How well this measurement knows the band it is about to write: taken from `depth` metres, from
+  // this horizontal direction. Computed once and passed to every cell in the band — the grid folds
+  // both in idempotently, so the repetition costs nothing and can't overstate the coverage.
+  const dirBit = azimuthBit(dx, dz);
+
   let touched = 0;
   for (let s = -trunc; s <= backTrunc + 1e-9; s += step) {
     const sx = px + ux * s;
     const sy = py + uy * s;
     const sz = pz + uz * s;
     const colorWeight = s >= -colorBand && s <= colorBand ? weight : 0;
-    grid.integrate(sx, sy, sz, -s, weight, r, g, b, colorWeight);
+    grid.integrate(sx, sy, sz, -s, weight, r, g, b, colorWeight, depth, dirBit);
     touched++;
   }
   return touched;

@@ -1,7 +1,27 @@
 import { describe, it, expect } from 'vitest';
-import { VoxelGrid, packKey, unpackKey, type VoxelView } from '../src/voxel/grid';
+import {
+  VoxelGrid,
+  packKey,
+  unpackKey,
+  azimuthBit,
+  popcount8,
+  type VoxelView,
+} from '../src/voxel/grid';
 
-const view = (): VoxelView => ({ cx: 0, cy: 0, cz: 0, r: 0, g: 0, b: 0, weight: 0, sdf: 0 });
+const view = (): VoxelView => ({
+  cx: 0,
+  cy: 0,
+  cz: 0,
+  r: 0,
+  g: 0,
+  b: 0,
+  weight: 0,
+  sdf: 0,
+  confirmed: false,
+});
+
+/** Key of the cell containing the world origin, where the confidence tests integrate. */
+const originKey = packKey(0, 0, 0) as number;
 
 /** Drain the renderer dirty set and return the single key that was touched. */
 const soleKey = (g: VoxelGrid): number => {
@@ -268,5 +288,165 @@ describe('VoxelGrid.forEachDownsampled', () => {
     let n = 0;
     g.forEachDownsampled(4, 1, () => n++);
     expect(n).toBe(1);
+  });
+});
+
+describe('azimuthBit / popcount8', () => {
+  it('gives the 8 compass directions 8 distinct bits', () => {
+    const dirs: Array<[number, number]> = [
+      [1, 0],
+      [1, 1],
+      [0, 1],
+      [-1, 1],
+      [-1, 0],
+      [-1, -1],
+      [0, -1],
+      [1, -1],
+    ];
+    const bits = new Set(dirs.map(([dx, dz]) => azimuthBit(dx, dz)));
+    expect(bits.size).toBe(8);
+    // Every bit lands inside the byte popcount8 reads.
+    for (const b of bits) expect(b & 0xff).toBe(b);
+  });
+
+  it('is scale-invariant — only the direction matters', () => {
+    expect(azimuthBit(3, 4)).toBe(azimuthBit(0.3, 0.4));
+  });
+
+  it('wraps at the +/-pi seam instead of overflowing the mask', () => {
+    // atan2 returns exactly pi here; the sector must fold back to a valid bit, not bit 8.
+    const b = azimuthBit(-1, 0);
+    expect(b & 0xff).toBe(b);
+    expect(b).toBeGreaterThan(0);
+  });
+
+  it('reports no direction for a purely vertical ray', () => {
+    expect(azimuthBit(0, 0)).toBe(0);
+  });
+
+  it('counts set bits in the low byte', () => {
+    expect(popcount8(0)).toBe(0);
+    expect(popcount8(0b1)).toBe(1);
+    expect(popcount8(0b10110)).toBe(3);
+    expect(popcount8(0xff)).toBe(8);
+  });
+});
+
+describe('confidence: bestDepth / dirMask', () => {
+  it('keeps the closest observation distance, never a later farther one', () => {
+    // lockRatio effectively off, so this measures the min itself rather than the lock.
+    const g = new VoxelGrid({
+      voxelSize: 0.02,
+      confirmWeight: 1,
+      confirmDist: 0.5,
+      lockRatio: 1e9,
+    });
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 2.0, 0b1);
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 0.4, 0b1); // closer: takes over
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 3.0, 0b1); // farther: must not undo it
+    const out = view();
+    expect(g.readVoxel(originKey, out)).toBe(true);
+    expect(out.confirmed).toBe(true); // 0.4 m <= confirmDist
+  });
+
+  it('confirms a wall seen only from one direction, given a close enough look', () => {
+    // The OR in isConfirmed exists for exactly this: a flat wall has no second side to view it
+    // from, so requiring direction diversity would leave every wall provisional forever.
+    const g = new VoxelGrid({
+      voxelSize: 0.02,
+      confirmWeight: 2,
+      confirmDist: 1.0,
+      confirmDirs: 3,
+    });
+    g.integrate(0, 0, 0, 0, 5, 0, 0, 0, 0, 0.8, 0b1);
+    const out = view();
+    g.readVoxel(originKey, out);
+    expect(out.confirmed).toBe(true);
+  });
+
+  it('confirms a distant cell once it has been seen from enough directions', () => {
+    const g = new VoxelGrid({
+      voxelSize: 0.02,
+      confirmWeight: 2,
+      confirmDist: 1.0,
+      confirmDirs: 3,
+    });
+    const out = view();
+    g.integrate(0, 0, 0, 0, 5, 0, 0, 0, 0, 2.5, 0b1);
+    g.readVoxel(originKey, out);
+    expect(out.confirmed).toBe(false); // far, and only one direction
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 2.5, 0b10);
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 2.5, 0b100);
+    g.readVoxel(originKey, out);
+    expect(out.confirmed).toBe(true); // 3 directions
+  });
+
+  it('does not confirm on distance alone without enough weight', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, confirmWeight: 8, confirmDist: 1.0 });
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 0.3, 0b1);
+    const out = view();
+    g.readVoxel(originKey, out);
+    expect(out.confirmed).toBe(false);
+  });
+});
+
+describe('confidence: locking a confirmed cell', () => {
+  /** A cell confirmed by a close, well-weighted look. */
+  const confirmedGrid = (): { g: VoxelGrid; key: number } => {
+    const g = new VoxelGrid({
+      voxelSize: 0.02,
+      truncation: 0.06,
+      confirmWeight: 4,
+      confirmDist: 1.0,
+      lockRatio: 2,
+      maxWeight: 100,
+    });
+    g.integrate(0, 0, 0, 0, 10, 0, 0, 0, 0, 0.5, 0b1); // bestDepth 0.5 -> lock beyond 1.0 m
+    return { g, key: originKey };
+  };
+
+  it('ignores a distant observation entirely', () => {
+    const { g, key } = confirmedGrid();
+    const before = view();
+    g.readVoxel(key, before);
+    g.integrate(0, 0, 0, 0.05, 5, 0, 0, 0, 0, 3.0, 0b10); // 3 m: well past 0.5 * 2
+    const after = view();
+    g.readVoxel(key, after);
+    expect(after.sdf).toBe(before.sdf);
+    expect(after.weight).toBe(before.weight);
+  });
+
+  it('still accepts a comparably close observation', () => {
+    const { g, key } = confirmedGrid();
+    const before = view();
+    g.readVoxel(key, before);
+    g.integrate(0, 0, 0, 0.05, 5, 0, 0, 0, 0, 0.6, 0b10); // inside 0.5 * 2
+    const after = view();
+    g.readVoxel(key, after);
+    expect(after.sdf).toBeGreaterThan(before.sdf);
+  });
+
+  it('cannot be carved away from a distance', () => {
+    const { g, key } = confirmedGrid();
+    for (let i = 0; i < 50; i++) g.integrateFree(key, 5, 1, 3.0);
+    const out = view();
+    expect(g.readVoxel(key, out)).toBe(true); // still there
+    expect(out.sdf).toBe(0);
+  });
+
+  it('can still be carved away once you get close again', () => {
+    const { g, key } = confirmedGrid();
+    let surface = true;
+    for (let i = 0; i < 50 && surface; i++) surface = g.integrateFree(key, 5, 1, 0.5);
+    expect(surface).toBe(false);
+  });
+
+  it('leaves an unconfirmed cell fully carvable from any distance', () => {
+    const g = new VoxelGrid({ voxelSize: 0.02, truncation: 0.06, confirmWeight: 100 });
+    g.integrate(0, 0, 0, 0, 1, 0, 0, 0, 0, 0.5, 0b1);
+    const key = originKey;
+    let surface = true;
+    for (let i = 0; i < 50 && surface; i++) surface = g.integrateFree(key, 5, 1, 3.0);
+    expect(surface).toBe(false);
   });
 });
