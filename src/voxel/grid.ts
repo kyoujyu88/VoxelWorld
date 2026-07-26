@@ -58,6 +58,41 @@ export interface VoxelRecord {
   b: number;
   /** Accumulated color weight, capped at maxWeight. */
   cw: number;
+  /**
+   * The closest this cell has ever been observed from (m); Infinity until seen. Weight alone can't
+   * distinguish "stared at from across the room for 10 seconds" from "walked right up to" — but
+   * depth error grows steeply with range, so it is proximity, not repetition, that makes a cell
+   * trustworthy.
+   */
+  bestDepth: number;
+  /** Bitmask of the horizontal sectors this cell has been observed from (see `azimuthBit`). */
+  dirMask: number;
+}
+
+const DIR_SECTORS = 8;
+const TWO_PI = Math.PI * 2;
+
+/**
+ * Bit for the horizontal sector a view ray arrived from — the second half of "how well do we know
+ * this cell". A surface seen from several directions has been checked against itself, which a
+ * single lucky angle never is. Returns 0 (no information) for a purely vertical ray, which ORs in
+ * harmlessly.
+ *
+ * `dx`/`dz` are the horizontal components of camera→cell; only the azimuth matters, so the vector
+ * needs no normalizing.
+ */
+export function azimuthBit(dx: number, dz: number): number {
+  if (dx === 0 && dz === 0) return 0;
+  const a = Math.atan2(dz, dx) + Math.PI; // [0, 2π]
+  return 1 << (Math.floor((a / TWO_PI) * DIR_SECTORS) & (DIR_SECTORS - 1));
+}
+
+/** Number of set bits in the low byte — how many distinct directions a cell has been seen from. */
+export function popcount8(mask: number): number {
+  let m = mask & 0xff;
+  m = m - ((m >> 1) & 0x55);
+  m = (m & 0x33) + ((m >> 2) & 0x33);
+  return (m + (m >> 4)) & 0x0f;
 }
 
 export interface VoxelGridOptions {
@@ -83,6 +118,14 @@ export interface VoxelGridOptions {
    * Larger renders a thicker shell; smaller can leave pinholes on steep surfaces.
    */
   surfaceBand?: number;
+  /** Accumulated weight a cell needs before it can be confirmed (default 8). */
+  confirmWeight?: number;
+  /** Distance (m) a single look confirms from (default 1.0). Tunable at runtime. */
+  confirmDist?: number;
+  /** Distinct horizontal sectors that confirm a cell seen only from farther away (default 3). */
+  confirmDirs?: number;
+  /** How much farther than a cell's best look an observation may be and still change it (default 2). */
+  lockRatio?: number;
 }
 
 export interface VoxelView {
@@ -97,6 +140,8 @@ export interface VoxelView {
   weight: number;
   /** Weighted-average signed distance to the surface (m). */
   sdf: number;
+  /** Whether this cell has been observed well enough to be locked in (see `isConfirmed`). */
+  confirmed: boolean;
 }
 
 export class VoxelGrid {
@@ -105,6 +150,11 @@ export class VoxelGrid {
   readonly truncation: number;
   readonly maxWeight: number;
   readonly surfaceBand: number;
+  readonly confirmWeight: number;
+  readonly confirmDirs: number;
+  readonly lockRatio: number;
+  /** Mutable so the on-device slider can re-classify an existing scan without re-scanning it. */
+  confirmDist: number;
   private readonly cells = new Map<number, VoxelRecord>();
   /** Keys touched since the last drainDirty() — lets the renderer update incrementally. */
   private readonly dirty = new Set<number>();
@@ -127,6 +177,10 @@ export class VoxelGrid {
     this.truncation = options.truncation ?? this.voxelSize * 3;
     this.maxWeight = options.maxWeight ?? 20;
     this.surfaceBand = options.surfaceBand ?? this.voxelSize * 0.75;
+    this.confirmWeight = options.confirmWeight ?? 8;
+    this.confirmDist = options.confirmDist ?? 1.0;
+    this.confirmDirs = options.confirmDirs ?? 3;
+    this.lockRatio = options.lockRatio ?? 2;
   }
 
   /** Total stored cells (surface *and* the free/occluded band around it). */
@@ -140,12 +194,43 @@ export class VoxelGrid {
   }
 
   /**
+   * True once a cell has been observed well enough to be trusted and locked in.
+   *
+   * Enough weight, *and* either a close look or looks from several directions. The two are an OR,
+   * not an AND, on purpose: a flat wall can only ever be seen from one side, so requiring direction
+   * diversity would mean walls never confirm. Conversely an object you have circled is well pinned
+   * even if you never got close to it.
+   */
+  isConfirmed(rec: VoxelRecord): boolean {
+    return (
+      rec.w >= this.confirmWeight &&
+      (rec.bestDepth <= this.confirmDist || popcount8(rec.dirMask) >= this.confirmDirs)
+    );
+  }
+
+  /**
+   * Whether an observation from `obsDepth` metres away is too poor to be allowed to touch this
+   * cell. A confirmed cell only yields to a look of comparable quality — no farther than
+   * `lockRatio` times its own best. That is what stops a distant glimpse from degrading, or the
+   * carve pass from erasing, something you already walked up to and scanned properly; getting
+   * close again always restores the ability to correct it.
+   */
+  private isLocked(rec: VoxelRecord, obsDepth: number): boolean {
+    return obsDepth > rec.bestDepth * this.lockRatio && this.isConfirmed(rec);
+  }
+
+  /**
    * Fuse one measurement into the cell containing (x, y, z).
    *
    * `sdf` is the signed distance from this point to the measured surface along the view ray
    * (positive in front of it / toward the camera, negative behind); it is truncated internally.
    * `weight` is the measurement's confidence — callers should use ~1/z². Color is optional: pass
    * `colorWeight > 0` only near the surface, where a color sample actually belongs to it.
+   *
+   * `obsDepth` is how far away the measurement was taken and `dirBit` which direction it came from
+   * (see `azimuthBit`); together they build the cell's confidence. Both fold in idempotently — min
+   * and OR — so the several calls one measurement makes along its truncation band cannot inflate
+   * either. They default to "no information", which leaves the pure-fusion behaviour unchanged.
    */
   integrate(
     x: number,
@@ -157,6 +242,8 @@ export class VoxelGrid {
     g = 0,
     b = 0,
     colorWeight = 0,
+    obsDepth = Infinity,
+    dirBit = 0,
   ): void {
     if (!Number.isFinite(x) || !Number.isFinite(y) || !Number.isFinite(z)) return;
     if (!Number.isFinite(sdf) || !(weight > 0)) return;
@@ -177,14 +264,26 @@ export class VoxelGrid {
       }
       // Colour starts empty and is only ever set through the colorWeight path below, so a
       // geometry-only sample (one taken away from the surface) never tints a cell.
-      rec = { sdf: clamped, w: Math.min(weight, this.maxWeight), r: 0, g: 0, b: 0, cw: 0 };
+      rec = {
+        sdf: clamped,
+        w: Math.min(weight, this.maxWeight),
+        r: 0,
+        g: 0,
+        b: 0,
+        cw: 0,
+        bestDepth: obsDepth,
+        dirMask: dirBit,
+      };
       this.cells.set(key, rec);
       this.growBounds(xi, yi, zi);
     } else {
+      if (this.isLocked(rec, obsDepth)) return; // too distant a look to touch a confirmed cell
       // Weighted running average of the distance, with the weight capped (KinectFusion).
       const wNew = rec.w + weight;
       rec.sdf = (rec.sdf * rec.w + clamped * weight) / wNew;
       rec.w = wNew > this.maxWeight ? this.maxWeight : wNew;
+      if (obsDepth < rec.bestDepth) rec.bestDepth = obsDepth;
+      rec.dirMask |= dirBit;
     }
 
     if (colorWeight > 0) {
@@ -204,10 +303,15 @@ export class VoxelGrid {
    * average distance toward +truncation; once it leaves the surface band the cell stops being
    * drawn, and a cell that is both empty and unobserved is dropped entirely to free memory.
    * Returns whether the cell still counts as surface, so a renderer can drop its instance.
+   *
+   * `obsDepth` is how far the carving view is from the cell. Erasure is where a distant view does
+   * the most damage — it deletes outright rather than nudging an average — so a confirmed cell is
+   * protected from it by the same rule that protects it from fusion.
    */
-  integrateFree(key: number, weight: number, minWeight: number): boolean {
+  integrateFree(key: number, weight: number, minWeight: number, obsDepth = Infinity): boolean {
     const rec = this.cells.get(key);
     if (rec === undefined) return false;
+    if (this.isLocked(rec, obsDepth)) return this.isSurface(rec, minWeight); // keep it as it stands
     const wNew = rec.w + weight;
     rec.sdf = (rec.sdf * rec.w + this.truncation * weight) / wNew;
     rec.w = wNew > this.maxWeight ? this.maxWeight : wNew;
@@ -304,6 +408,7 @@ export class VoxelGrid {
     out.b = rec.b;
     out.weight = rec.w;
     out.sdf = rec.sdf;
+    out.confirmed = this.isConfirmed(rec);
     return true;
   }
 
@@ -322,7 +427,15 @@ export class VoxelGrid {
    */
   forEachSurfacePoint(
     minWeight: number,
-    cb: (cx: number, cy: number, cz: number, r: number, g: number, b: number) => void,
+    cb: (
+      cx: number,
+      cy: number,
+      cz: number,
+      r: number,
+      g: number,
+      b: number,
+      confirmed: boolean,
+    ) => void,
   ): void {
     const s = this.voxelSize;
     const half = s * 0.5;
@@ -340,6 +453,7 @@ export class VoxelGrid {
         rec.r,
         rec.g,
         rec.b,
+        this.isConfirmed(rec),
       );
     }
   }
@@ -354,14 +468,25 @@ export class VoxelGrid {
   forEachDownsampled(
     factor: number,
     minWeight: number,
-    cb: (cx: number, cy: number, cz: number, r: number, g: number, b: number) => void,
+    cb: (
+      cx: number,
+      cy: number,
+      cz: number,
+      r: number,
+      g: number,
+      b: number,
+      confirmed: boolean,
+    ) => void,
   ): void {
     const f = Math.max(1, Math.floor(factor));
     if (f === 1) {
       this.forEachSurfacePoint(minWeight, cb);
       return;
     }
-    const coarse = new Map<number, { w: number; r: number; g: number; b: number }>();
+    const coarse = new Map<
+      number,
+      { w: number; r: number; g: number; b: number; confirmed: boolean }
+    >();
     for (const [key, rec] of this.cells) {
       if (!this.isSurface(rec, minWeight)) continue;
       const z = key % BASE;
@@ -376,7 +501,7 @@ export class VoxelGrid {
       if (ckey === null) continue;
       let c = coarse.get(ckey);
       if (c === undefined) {
-        c = { w: 0, r: 0, g: 0, b: 0 };
+        c = { w: 0, r: 0, g: 0, b: 0, confirmed: false };
         coarse.set(ckey, c);
       }
       // Weight each constituent by how well established it is.
@@ -385,12 +510,23 @@ export class VoxelGrid {
       c.g = (c.g * c.w + rec.g * rec.w) / wNew;
       c.b = (c.b * c.w + rec.b * rec.w) / wNew;
       c.w = wNew;
+      // A coarse cell counts as confirmed once any constituent is: at this size the block is a
+      // summary, and a block containing scanned surface should not read as "not scanned yet".
+      if (!c.confirmed && this.isConfirmed(rec)) c.confirmed = true;
     }
     const coarseSize = f * this.voxelSize;
     const half = coarseSize * 0.5;
     for (const [ckey, c] of coarse) {
       const { xi, yi, zi } = unpackKey(ckey);
-      cb(xi * coarseSize + half, yi * coarseSize + half, zi * coarseSize + half, c.r, c.g, c.b);
+      cb(
+        xi * coarseSize + half,
+        yi * coarseSize + half,
+        zi * coarseSize + half,
+        c.r,
+        c.g,
+        c.b,
+        c.confirmed,
+      );
     }
   }
 }

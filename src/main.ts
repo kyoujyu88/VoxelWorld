@@ -12,6 +12,7 @@ import { VoxelRenderer } from './render/voxelRenderer';
 import { OverheadPreview } from './render/overheadPreview';
 import { CarveContext } from './xr/carve';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
+import { StageTimer } from './ui/stageTimer';
 import { el, clear } from './ui/dom';
 
 declare const __BUILD_ID__: string;
@@ -40,8 +41,17 @@ const CARVE_MARGIN = 0.08; // surface must be ≥8cm beyond a voxel before it's 
 const CARVE_MIN_DEPTH = 0.2; // ignore voxels nearer than this to the camera when carving
 const CAMERA_W = 96; // downsampled camera readback size (portrait, ~855:1920)
 const CAMERA_H = 214;
-const RENDER_CAP = 250_000; // max instances drawn at once (2cm live path)
+// Instance budget, split by confidence tier. Confirmed cells are what a finished scan is made of,
+// so they get the larger share; provisional ones are transient by nature.
+const CONFIRMED_CAP = 180_000;
+const PROVISIONAL_CAP = 120_000;
+const RENDER_CAP = CONFIRMED_CAP + PROVISIONAL_CAP;
 const GRID_CAP = 2_000_000; // max internal 2cm cells — larger fields fit before hitting the cap
+// Confidence: weight needed before a cell can lock in, and how far a single look can confirm from.
+const CONFIRM_WEIGHT = 8;
+const CONFIRM_DIST_DEFAULT = 1.0;
+const CONFIRM_DIST_MIN = 0.4;
+const CONFIRM_DIST_MAX = 2.0;
 
 // Height-based fallback color window (local-space Y), floor..ceiling.
 const HEIGHT_LO = -1.3;
@@ -64,7 +74,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 7: TSDF フュージョン — 面までの符号付き距離を加重平均する方式（KinectFusion 系）に刷新。面が 1 層に収束し、手前の空間は自然に消えます。',
+        'Phase 8b: 信頼度でボクセルを確定 — よく観測できたボクセルは不透明になって固定され、離れても消えません。半透明のままのボクセルは「まだ精度が足りない＝近づいて」の合図です。',
     }),
   ]);
 
@@ -119,9 +129,11 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     maxVoxels: GRID_CAP,
     truncation: TRUNCATION,
     maxWeight: MAX_WEIGHT,
+    confirmWeight: CONFIRM_WEIGHT,
+    confirmDist: CONFIRM_DIST_DEFAULT,
   });
-  const voxels = new VoxelRenderer(RENDER_CAP, VOXEL_SIZE);
-  scene.add(voxels.mesh);
+  const voxels = new VoxelRenderer(CONFIRMED_CAP, PROVISIONAL_CAP, VOXEL_SIZE);
+  scene.add(voxels.root);
 
   const state: ScanState = {
     accumulating: true,
@@ -170,6 +182,23 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     stabSlider,
     stabLabel,
   ]);
+  const confirmSlider = el('input', {
+    type: 'range',
+    min: String(CONFIRM_DIST_MIN),
+    max: String(CONFIRM_DIST_MAX),
+    step: '0.1',
+    value: String(CONFIRM_DIST_DEFAULT),
+    className: 'size-slider',
+  });
+  const confirmLabel = el('span', {
+    className: 'size-label',
+    textContent: `${CONFIRM_DIST_DEFAULT.toFixed(1)}m`,
+  });
+  const confirmRow = el('div', { className: 'size-row' }, [
+    el('span', { className: 'size-cap', textContent: '確定距離' }),
+    confirmSlider,
+    confirmLabel,
+  ]);
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
   const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
   const colorBtn = el('button', { className: 'ctl', textContent: '🎨 色: カメラ' });
@@ -178,12 +207,13 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 7: TSDF フュージョン（符号付き距離の加重平均）',
+      textContent: 'Phase 8b: 信頼度で確定・ロック（半透明＝要接近）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
     sizeRow,
     stabRow,
+    confirmRow,
     el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
@@ -193,6 +223,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const overhead = new OverheadPreview(overheadCanvas);
   const carveCtx = new CarveContext();
   const reprojectStats: ReprojectStats = { emitted: 0, rejectedEdge: 0 };
+  const timer = new StageTimer();
 
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
@@ -258,6 +289,30 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       grid.markAllDirty();
     } else {
       voxels.rebuildDownsampled(grid, state.displayFactor, n);
+    }
+  });
+
+  // Confirmation distance: how close a single look has to be taken from to lock a cell in. Lower
+  // demands a closer approach before anything turns solid; raise it and more of the scan confirms
+  // (and locks) on the strength of a more distant look. Releasing re-classifies what is already
+  // scanned — no re-scan, same as the other two sliders.
+  const readConfirmDist = (): number => {
+    const v = parseFloat(confirmSlider.value);
+    if (!Number.isFinite(v)) return CONFIRM_DIST_DEFAULT;
+    return Math.min(CONFIRM_DIST_MAX, Math.max(CONFIRM_DIST_MIN, v));
+  };
+  confirmSlider.addEventListener('input', () => {
+    confirmLabel.textContent = `${readConfirmDist().toFixed(1)}m`;
+  });
+  confirmSlider.addEventListener('change', () => {
+    const d = readConfirmDist();
+    grid.confirmDist = d;
+    confirmLabel.textContent = `${d.toFixed(1)}m`;
+    if (state.displayFactor === 1) {
+      voxels.reset();
+      grid.markAllDirty(); // re-seeds every cell into whichever tier it now belongs to
+    } else {
+      voxels.rebuildDownsampled(grid, state.displayFactor, state.minWeight);
     }
   });
 
@@ -356,7 +411,9 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   };
 
   renderer.setAnimationLoop((time: number, frame?: XRFrame) => {
+    timer.beginFrame();
     renderer.render(scene, camera);
+    timer.lap('gl');
     // Seed the FPS window on the first frame (WebXR `time` is page-load-relative, not 0),
     // so the first reading isn't frameCount/absoluteTime garbage.
     if (fpsWindowStart === 0) {
@@ -407,6 +464,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         reprojectStats,
       );
     }
+    timer.lap('fuse');
 
     // 3D voxel display. Base size (2cm) is incremental every frame (cheap regardless of grid
     // size). Coarser sizes re-tessellate only on a slider change / pause (see handlers), since a
@@ -414,6 +472,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     // discard the renderer's dirty keys to keep that set bounded.
     if (state.displayFactor === 1) {
       voxels.applyUpdates(grid, state.minWeight);
+      timer.lap('draw');
       // Free-space carving: remove voxels floating in front of the measured surface, so getting
       // closer clears noise. Amortized (a slice of instances per frame). Base size only.
       if (latestDepth && state.accumulating) {
@@ -424,8 +483,10 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         });
         voxels.carve(grid, carveCtx, state.minWeight, CARVE_BUDGET, FREE_WEIGHT);
       }
+      timer.lap('carve');
     } else {
       grid.clearDirty();
+      timer.lap('draw');
     }
 
     // Overhead preview (bottom half, always base 2cm): incremental top-down redraw so the map
@@ -434,6 +495,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       lastPreview = time;
       overhead.update(grid, state.minWeight);
     }
+    timer.lap('prev');
 
     if (time - lastStats >= STATS_MS) {
       const dt = time - fpsWindowStart;
@@ -446,12 +508,14 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         info,
         state,
         grid,
-        voxels.drawn,
+        voxels,
         latestDepth,
         cameraReader,
         fps,
         reprojectStats,
+        timer,
       );
+      timer.reset();
       drawThumbnail(thumbCanvas, cameraReader);
     }
   });
@@ -487,11 +551,12 @@ function updateStats(
   info: SessionInfo,
   state: ScanState,
   grid: VoxelGrid,
-  rendered: number,
+  voxels: VoxelRenderer,
   depth: CpuDepthFrame | null,
   reader: CameraColorReader | null,
   fps: number,
   reprojectStats: ReprojectStats,
+  timer: StageTimer,
 ): void {
   const colorStatus =
     state.colorMode === 'height'
@@ -519,7 +584,24 @@ function updateStats(
         reprojectStats.emitted + reprojectStats.rejectedEdge
       ).toLocaleString()}`,
     },
-    { label: '描画中', value: `${rendered.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
+    { label: '描画中', value: `${voxels.drawn.toLocaleString()} / ${RENDER_CAP.toLocaleString()}` },
+    {
+      label: '確定 / 暫定',
+      value: `${voxels.drawnConfirmed.toLocaleString()} / ${voxels.drawnProvisional.toLocaleString()}`,
+    },
+    { label: '確定距離', value: `${grid.confirmDist.toFixed(1)}m` },
+    // CPU cost per frame by stage. If these sum to far less than the frame period implied by FPS,
+    // the bottleneck is the GPU (fill rate / instance count), not any of this code.
+    {
+      label: 'CPU ms',
+      value:
+        `計${timer.meanTotal().toFixed(1)}` +
+        ` (描画${timer.mean('gl').toFixed(1)}` +
+        ` 融合${timer.mean('fuse').toFixed(1)}` +
+        ` 追記${timer.mean('draw').toFixed(1)}` +
+        ` 除去${timer.mean('carve').toFixed(1)}` +
+        ` 俯瞰${timer.mean('prev').toFixed(1)})`,
+    },
     { label: '色', value: colorStatus },
     {
       label: '色向き',
@@ -538,6 +620,16 @@ function updateStats(
         value: s.medianMeters === null ? '—' : `${s.medianMeters.toFixed(2)}m`,
       },
     );
+  }
+  // Chrome-only and coarse, but this is a Chrome-on-Android target and the grid stores one object
+  // per cell — at room scale that is the single biggest thing on the heap, so it is worth seeing.
+  const heap = (performance as { memory?: { usedJSHeapSize: number; jsHeapSizeLimit: number } })
+    .memory;
+  if (heap) {
+    rows.push({
+      label: 'JS ヒープ',
+      value: `${(heap.usedJSHeapSize / 1048576).toFixed(0)} / ${(heap.jsHeapSizeLimit / 1048576).toFixed(0)} MB`,
+    });
   }
   if (grid.droppedAtCap > 0) {
     rows.push({ label: '⚠ グリッド上限', value: `${grid.droppedAtCap.toLocaleString()} 破棄` });

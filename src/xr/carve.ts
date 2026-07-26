@@ -21,6 +21,21 @@ export function isFreeSpace(voxelDepth: number, measuredDepth: number, margin: n
   return measuredDepth > 0 && measuredDepth > voxelDepth + margin;
 }
 
+/**
+ * How strongly a view `d` metres from a voxel is allowed to erase it, normalized to 1 at 1 m.
+ *
+ * Fusion weights a measurement by ~1/d² because depth error grows steeply with range, but carving
+ * used a flat weight regardless of distance — so erasing from across the room pushed roughly 18x
+ * harder than fusing from there did. That asymmetry is why a surface scanned up close visibly
+ * degraded the moment it drifted into a distant view: nothing was being added, but plenty was
+ * still being taken away. Matching the falloff makes approaching the way you clear noise, which is
+ * also how it already felt like it ought to work.
+ */
+export function carveWeightScale(d: number, minDepth = 0.3): number {
+  const z = d > minDepth ? d : minDepth;
+  return 1 / (z * z);
+}
+
 export interface CarveOptions {
   /** NDC-y convention (must match the reprojection flipY). */
   flipY: boolean;
