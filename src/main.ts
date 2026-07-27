@@ -12,11 +12,12 @@ import { readCpuDepthFrame, type CpuDepthFrame } from './xr/depth';
 import { reprojectDepthFrame, type ReprojectStats } from './xr/reproject';
 import { computeDepthStats } from './render/depthHeatmap';
 import { CameraColorReader, type RGB } from './xr/cameraColor';
-import { VoxelGrid } from './voxel/grid';
+import { VoxelGrid, azimuthBit } from './voxel/grid';
 import { fuseDepthSample } from './voxel/fuse';
 import { VoxelRenderer } from './render/voxelRenderer';
 import { OverheadPreview } from './render/overheadPreview';
 import { CarveContext } from './xr/carve';
+import { PlaneSet, type SnapResult } from './xr/planes';
 import { renderCapabilityStatus, renderKVTable, type KV } from './ui/probePanel';
 import { StageTimer } from './ui/stageTimer';
 import { el, clear } from './ui/dom';
@@ -58,6 +59,11 @@ const CONFIRM_WEIGHT = 8;
 const CONFIRM_DIST_DEFAULT = 1.0;
 const CONFIRM_DIST_MIN = 0.4;
 const CONFIRM_DIST_MAX = 2.0;
+// Plane snapping. The tolerance doubles as the blast radius if the runtime's own plane is off, so
+// it stays tight. The weight boost reflects that a snapped sample has essentially no perpendicular
+// error left — the plane averaged that away across thousands of measurements.
+const PLANE_TOLERANCE = 0.03;
+const PLANE_WEIGHT_BOOST = 3;
 
 // Height-based fallback color window (local-space Y), floor..ceiling.
 const HEIGHT_LO = -1.3;
@@ -72,6 +78,7 @@ interface ScanState {
   camFlipY: boolean;
   displayFactor: number; // display/export voxel size = displayFactor × base (2cm); 1 = live 2cm
   minWeight: number; // accumulated weight a cell needs to be drawn/kept
+  usePlanes: boolean; // snap measurements onto ARCore's detected walls/floors
 }
 
 async function main(app: HTMLDivElement): Promise<void> {
@@ -80,7 +87,7 @@ async function main(app: HTMLDivElement): Promise<void> {
     el('p', {
       className: 'subtitle',
       textContent:
-        'Phase 8b: 信頼度でボクセルを確定 — よく観測できたボクセルは不透明になって固定され、離れても消えません。半透明のままのボクセルは「まだ精度が足りない＝近づいて」の合図です。',
+        'Phase 8d: 平面吸着 — ARCore が見つけた壁や床に測定点をスナップし、平らな面のボコボコを取り除きます。ドアや窓の開口は塗り潰さず、測定のあった場所にだけボクセルを置きます。',
     }),
   ]);
 
@@ -148,6 +155,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     camFlipY: true,
     displayFactor: 1,
     minWeight: MIN_W_DEFAULT,
+    usePlanes: true,
   };
   const heightColor = new THREE.Color();
   const camRGB: RGB = { r: 0, g: 0, b: 0 };
@@ -205,6 +213,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     confirmSlider,
     confirmLabel,
   ]);
+  const planeBtn = el('button', { className: 'ctl', textContent: '🧱 平面: ON' });
   const pauseBtn = el('button', { className: 'ctl', textContent: '⏸ 一時停止' });
   const clearBtn = el('button', { className: 'ctl', textContent: '🗑 クリア' });
   const colorBtn = el('button', { className: 'ctl', textContent: '🎨 色: カメラ' });
@@ -213,14 +222,14 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   hud.append(
     el('div', {
       className: 'hud-title',
-      textContent: 'Phase 8b: 信頼度で確定・ロック（半透明＝要接近）',
+      textContent: 'Phase 8d: 平面吸着（壁・床にスナップ）',
     }),
     el('div', { className: 'overhead-wrap' }, [overheadCanvas, thumbCanvas]),
     statsSlot,
     sizeRow,
     stabRow,
     confirmRow,
-    el('div', { className: 'controls' }, [pauseBtn, clearBtn, colorBtn, flipBtn, endBtn]),
+    el('div', { className: 'controls' }, [pauseBtn, clearBtn, planeBtn, colorBtn, flipBtn, endBtn]),
     el('div', { className: 'build-stamp', textContent: `build: ${__BUILD_ID__}` }),
   );
   overlay.append(hud);
@@ -230,10 +239,18 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const carveCtx = new CarveContext();
   const reprojectStats: ReprojectStats = { emitted: 0, rejectedEdge: 0 };
   const timer = new StageTimer();
+  const planeSet = new PlaneSet(PLANE_TOLERANCE);
+  const snapOut: SnapResult = { x: 0, y: 0, z: 0 };
+  let snappedCount = 0;
+  let sampleCount = 0;
   // Whether ARCore is handing us its own wall/floor fits. Read each frame, reported in the HUD:
   // if this stays unavailable, plane-based simplification has to be computed ourselves.
   let planes: PlaneProbe = { available: false, count: 0, horizontal: 0, vertical: 0 };
 
+  planeBtn.addEventListener('click', () => {
+    state.usePlanes = !state.usePlanes;
+    planeBtn.textContent = state.usePlanes ? '🧱 平面: ON' : '🧱 平面: OFF';
+  });
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
     pauseBtn.textContent = state.accumulating ? '⏸ 一時停止' : '▶ 再開';
@@ -416,6 +433,17 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       g = heightColor.g * 255;
       b = heightColor.b * 255;
     }
+    sampleCount++;
+    // On a known plane the surface position is already settled, so there is no zero crossing to
+    // search for: write the one cell directly instead of walking a band of four. The measurement
+    // also carries more weight, having had its perpendicular error removed.
+    if (state.usePlanes && planeSet.snap(x, y, z, snapOut)) {
+      snappedCount++;
+      const pw = w * PLANE_WEIGHT_BOOST;
+      const dirBit = azimuthBit(snapOut.x - camX, snapOut.z - camZ);
+      grid.integrate(snapOut.x, snapOut.y, snapOut.z, 0, pw, r, g, b, pw, depth, dirBit);
+      return;
+    }
     fuseDepthSample(grid, camX, camY, camZ, x, y, z, depth, w, r, g, b);
   };
 
@@ -439,6 +467,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
     const view = pose.views[0];
     latestDepth = readCpuDepthFrame(frame, view);
     planes = readPlaneProbe(frame);
+    if (refSpace) planeSet.update(frame, refSpace);
 
     // Throttled camera readback (raw GL), then resync three's tracked state.
     if (
@@ -459,6 +488,8 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
       camX = camPos.x;
       camY = camPos.y;
       camZ = camPos.z;
+      snappedCount = 0;
+      sampleCount = 0;
       reprojectDepthFrame(
         latestDepth,
         view.projectionMatrix,
@@ -525,6 +556,9 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         reprojectStats,
         timer,
         planes,
+        snappedCount,
+        sampleCount,
+        state.usePlanes,
       );
       timer.reset();
       drawThumbnail(thumbCanvas, cameraReader);
@@ -569,6 +603,9 @@ function updateStats(
   reprojectStats: ReprojectStats,
   timer: StageTimer,
   planes: PlaneProbe,
+  snappedCount: number,
+  sampleCount: number,
+  usePlanes: boolean,
 ): void {
   const colorStatus =
     state.colorMode === 'height'
@@ -625,6 +662,12 @@ function updateStats(
       value: planes.available
         ? `${planes.count} 面 (水平${planes.horizontal} / 垂直${planes.vertical})`
         : '不可',
+    },
+    {
+      label: '平面吸着',
+      value: !usePlanes
+        ? 'OFF'
+        : `${snappedCount.toLocaleString()} / ${sampleCount.toLocaleString()}`,
     },
   ];
 
