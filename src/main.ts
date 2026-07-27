@@ -1,7 +1,13 @@
 import './style.css';
 import * as THREE from 'three';
 import { probeXRSupport } from './xr/capabilities';
-import { requestArSession, readSessionInfo, type SessionInfo } from './xr/session';
+import {
+  requestArSession,
+  readSessionInfo,
+  readPlaneProbe,
+  type SessionInfo,
+  type PlaneProbe,
+} from './xr/session';
 import { readCpuDepthFrame, type CpuDepthFrame } from './xr/depth';
 import { reprojectDepthFrame, type ReprojectStats } from './xr/reproject';
 import { computeDepthStats } from './render/depthHeatmap';
@@ -224,6 +230,9 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
   const carveCtx = new CarveContext();
   const reprojectStats: ReprojectStats = { emitted: 0, rejectedEdge: 0 };
   const timer = new StageTimer();
+  // Whether ARCore is handing us its own wall/floor fits. Read each frame, reported in the HUD:
+  // if this stays unavailable, plane-based simplification has to be computed ourselves.
+  let planes: PlaneProbe = { available: false, count: 0, horizontal: 0, vertical: 0 };
 
   pauseBtn.addEventListener('click', () => {
     state.accumulating = !state.accumulating;
@@ -429,6 +438,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
 
     const view = pose.views[0];
     latestDepth = readCpuDepthFrame(frame, view);
+    planes = readPlaneProbe(frame);
 
     // Throttled camera readback (raw GL), then resync three's tracked state.
     if (
@@ -514,6 +524,7 @@ async function startAR(errorSlot: HTMLElement): Promise<void> {
         fps,
         reprojectStats,
         timer,
+        planes,
       );
       timer.reset();
       drawThumbnail(thumbCanvas, cameraReader);
@@ -557,6 +568,7 @@ function updateStats(
   fps: number,
   reprojectStats: ReprojectStats,
   timer: StageTimer,
+  planes: PlaneProbe,
 ): void {
   const colorStatus =
     state.colorMode === 'height'
@@ -608,6 +620,12 @@ function updateStats(
       value: `X:${state.camFlipX ? '反転' : '正'} Y:${state.camFlipY ? '反転' : '正'}`,
     },
     { label: 'depthUsage', value: info.depthUsage ?? '—' },
+    {
+      label: '平面検出',
+      value: planes.available
+        ? `${planes.count} 面 (水平${planes.horizontal} / 垂直${planes.vertical})`
+        : '不可',
+    },
   ];
 
   if (depth) {
